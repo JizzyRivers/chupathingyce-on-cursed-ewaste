@@ -138,11 +138,11 @@ obtained (the timed screenshot is only saved in a map), so the menu as it
 reaches the 848 or 640 surface, and the ring screens, Online Games and the
 Back + d-pad right screenshot, are not checked.
 
-Decision: the rule was that 848x480 becomes the default if it is no more
-than 1 ms slower than 640x360 and the picture is right. The picture is
-right, but 848 is more than 1 ms slower on three of four maps, so run.sh is
-left as it was (1280x720). The owner decides between taking the 4.5 ms of
-848x480 with the interface pixel for pixel, and the extra 1.5 ms of 640x360.
+Decision (2026-11-14): 848x480 is run.sh's default. 640x360 is 1.5 ms
+faster on average, but it scales the 640x480 interface down, and menus and
+text are what a smaller surface hurts; `launch.env` can still set another
+size. Still to check by eye on the television: the main menu, the ring
+screens and Online Games at 848x480.
 
 ### Phase 2. Start-up time (expected 26 s to under 10 s)
 

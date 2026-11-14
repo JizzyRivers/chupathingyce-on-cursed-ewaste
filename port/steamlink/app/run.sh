@@ -37,6 +37,12 @@ mkdir -p "$HALO_SCREENSHOT_DIR"
 # the shader compiler's load-time constants, which its driver worked out again
 # at every draw: a sixth of a frame at bloodgulch's spawn
 export VC_ENABLE_LTC=0
+# the picture drawn at 848x480 and scaled to the television by the box's
+# display hardware (Marvell's EGL): 3 to 6 ms a frame less than at 1280x720,
+# with the game's 640x480 interface still pixel for pixel (launch.env can
+# set others)
+export EGL_MVGFX_W=848
+export EGL_MVGFX_H=480
 # the box has no certificate authorities of its own, for the game list's https
 export SSL_CERT_FILE="$app/ca-certificates.crt"
 # (with the app, which an update replaces, not with the maps on the stick)
