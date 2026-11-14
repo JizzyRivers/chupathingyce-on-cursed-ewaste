@@ -165,6 +165,42 @@ Ideas taken from the other ports, to be measured one at a time:
 - Per-map view distance (the 3DS port: 60 units on Halo, Silent Cartographer
   and 343 Guilty Spark, 80 elsewhere, longer in cutscenes). Ours is one
   value, 60, everywhere.
+
+
+  Measured 2026-11-14 (round 2): `display.performance_view_distance` is
+  60.0 on the box (the default; the stick's `config.toml` has the line
+  commented out). The value was set for each run with the environment
+  variable `HALO_PERFORMANCE_VIEW_DISTANCE` in launch.env, not by editing
+  `config.toml`, so the file was not touched (its md5 was
+  85637f02974dc3bedf29fba6270e96b9 before and after; that the variable
+  overrides the file was not checked directly, but the draws moved with it:
+  sidewinder 58 draws at 30 and 45, 61 at 60 and 90). 848x480, no
+  `HALO_PERF_LOG`, 110 s a map at the spawn, one run per cell; ms a frame is
+  the mean of the last three "frames N to M" samples after the first (a 110
+  s run has only two to three: n is given where it is 2), draws are the
+  layer's count:
+
+  | Map | 30 | 45 | 60 (default) | 90 |
+  |---|---|---|---|---|
+  | carousel | 71.8 (n=2), 171 draws | 71.5 (n=2), 171 | 72.0 (n=2), 171 | 76.1 (n=2; 80.0 and 72.2), 171 |
+  | boardingaction | 64.9 (71.0 and 58.8; n=2), 141 | 59.0 (n=2), 141 | 59.0 (n=3), 141 | 59.2 (n=2), 141 |
+  | damnation | 58.1 (n=2), 102 to 103 | 58.6 (n=2), 102 | 59.3 (n=2), 102 | 59.5 (n=2), 102 |
+  | sidewinder | 40.1 (n=3), 58 | 40.5 (n=3), 58 | 42.9 (47.6, 40.6, 40.6; n=3), 61 | 40.4 (n=3), 61 |
+
+  Peak memory 148 to 159 MB in all sixteen runs. The view distance changes
+  nothing measurable at these spawns: the draws are the same from 30 to 90
+  on carousel, boardingaction and damnation (damnation 103 in one window at
+  30), and sidewinder loses 3 draws at 30 and 45, with its ms inside the
+  noise (one slow sample of 47.6 and 72.2 to 80.0 are single windows, not
+  a trend). These three are interiors and the sight lines at the spawn are
+  short; the maps where it was expected to pay (the outdoor ones: bloodgulch,
+  longest, beavercreek, wizard) were not run. Screenshots (the game's frame
+  at frame 900, one a distance): sidewinder at 30, 45, 60 and 90 look the
+  same (the spawn faces a wall; only the motion tracker ring at the bottom left differs, absent at 30 and 45 and faint at 60 and 90, which is the tracker's own state, not the distance);
+  carousel reached frame 900 in the 110 s only at 90, so no comparison
+  pictures for it. The visual cost of 30 was therefore not judged on a
+  view that has a distance. `config.toml` was never changed, so no backup or
+  restore was needed.
 - Adaptive quality with hysteresis (3DS and PS3 ports): shorten the view
   distance, then lower model detail, only under sustained load, and recover
   slowly. Never both trials at once.
@@ -195,6 +231,198 @@ Ideas taken from the other ports, to be measured one at a time:
   the other map does not. The HUD is 13 again. Which of the world's draws
   are lightmap, detail or specular passes is not yet known.
 
+  Round 2, measured 2026-11-14, 848x480, 120 s a map from the start of the
+  map, `HALO_PERF_LOG=1` (so these timings are not comparable with the
+  tables above; the phases of one map can be compared with each other).
+  Each column is one `perf:` line, the third from the last of the run
+  (a 30-frame window; every phase the line prints, nothing trimmed; "-"
+  means the line did not print that phase; the first line of each run is
+  the load and is left out). The draws are the ones the layer counted in
+  that part of the frame; they add up to the layer's own total for the map
+  (hangemhigh 40, chillout 99, damnation 102, carousel 171, boardingaction
+  141, bloodgulch 57):
+
+  | Phase (ms a frame) | hangemhigh | chillout | damnation | carousel | boardingaction | bloodgulch |
+  |---|---|---|---|---|---|---|
+  | total, ms a frame | 32.1 | 40.7 | 64.1 | 71.8 | 61.5 | 40.2 |
+  | tick | 1.1 | 1.5 | 3.8 | 4.0 | 2.9 | 4.6 |
+  | render | 17.9 | 34.0 | 51.5 | 61.8 | 52.7 | 26.5 |
+  | world | 5.4 (12 draws) | 18.8 (51 draws) | 25.1 (61 draws) | 25.2 (90 draws) | 31.5 (99 draws) | 9.8 (21 draws) |
+  | objects | 6.1 (15 draws) | 3.5 (10 draws) | 16.1 (26 draws) | 17.8 (36 draws) | 12.0 (25 draws) | 9.0 (22 draws) |
+  | transparent | 0.0 | 5.1 (25 draws) | 2.1 (2 draws) | 11.9 (32 draws) | 1.9 (4 draws) | 0.6 (1 draws) |
+  | effects | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+  | hud | 5.8 (13 draws) | 5.9 (13 draws) | 6.8 (13 draws) | 6.0 (13 draws) | 6.4 (13 draws) | 6.4 (13 draws) |
+  | sound | 0.2 | 0.5 | 1.2 | 1.0 | 1.0 | 0.5 |
+  | network | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+  | present | 11.7 | 3.6 | 6.7 | 3.8 | 4.0 | 7.2 |
+  | vsync | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.2 |
+  | begin | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+  | setup | 0.1 | 0.1 | 0.1 | 0.0 | 0.1 | 0.1 |
+  | flares | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+  | end | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 |
+  | render sound | 0.2 | 0.4 | 1.1 | 0.7 | 0.7 | 0.3 |
+  | units | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 |
+  | ai | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 | 0.0 |
+  | tick effects | 0.0 | 0.0 | 0.3 | 0.0 | 0.0 | 0.0 |
+  | game engine | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+  | tick objects | 0.8 | 1.2 | 2.9 | 3.6 | 2.3 | 4.2 |
+  | collision | 0.1 | 0.1 | 0.2 | 0.2 | 0.2 | 0.3 |
+  | netcode | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+  | bipeds | 0.4 | 0.4 | 0.4 | 0.5 | 0.4 | 0.3 |
+  | weapons | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.1 |
+  | other objects | 0.0 | 0.0 | 0.2 | 0.2 | 0.1 | 0.1 |
+  | damage | 0.0 | 0.1 | 0.3 | 0.2 | 0.1 | 0.2 |
+  | nodes | 0.1 | 0.2 | 0.6 | 0.7 | 0.6 | 1.1 |
+  | functions | 0.1 | 0.1 | 0.4 | 0.6 | 0.3 | 0.4 |
+  | object lights | 0.0 | 0.1 | 0.2 | 0.4 | 0.2 | 0.8 |
+  | activation | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+  | garbage | 0.0 | 0.0 | 0.1 | 0.0 | 0.0 | 0.0 |
+  | vehicles | - | - | - | - | - | 0.4 |
+
+  The tick's parts (units to garbage) are inside "tick"; "render sound" is
+  inside "render"; world, objects, transparent, effects, hud, begin,
+  setup, flares and end are render's parts. One window is noisy (the same
+  map's windows move by 1 to 3 ms), so the mean of the steady windows (the
+  9th to the last: 65, 57, 39, 25, 32 and 55 windows of 30 frames) is given
+  too:
+
+  | Mean of the steady windows (ms) | hangemhigh | chillout | damnation | carousel | boardingaction | bloodgulch |
+  |---|---|---|---|---|---|---|
+  | total | 32.49 | 42.42 | 58.86 | 73.92 | 62.94 | 39.02 |
+  | tick | 1.23 | 1.60 | 3.45 | 4.31 | 2.87 | 4.22 |
+  | render | 18.65 | 35.46 | 47.03 | 63.88 | 52.89 | 25.73 |
+  | world | 5.10 | 19.43 | 23.28 | 25.73 | 31.65 | 9.58 |
+  | objects | 6.48 | 3.60 | 14.52 | 18.44 | 11.76 | 8.78 |
+  | transparent | 0.00 | 5.62 | 1.94 | 12.49 | 1.93 | 0.57 |
+  | hud | 6.51 | 6.11 | 6.10 | 6.26 | 6.39 | 6.23 |
+  | sound | 0.29 | 0.58 | 0.99 | 0.89 | 1.15 | 0.50 |
+  | render sound | 0.26 | 0.45 | 0.85 | 0.71 | 0.88 | 0.28 |
+  | present | 11.17 | 3.79 | 6.60 | 3.78 | 3.79 | 7.28 |
+  | tick objects | 0.90 | 1.21 | 2.89 | 3.78 | 2.37 | 3.85 |
+  | nodes | 0.16 | 0.21 | 0.68 | 0.82 | 0.56 | 0.96 |
+  | functions | 0.10 | 0.11 | 0.47 | 0.54 | 0.32 | 0.43 |
+  | object lights | 0.04 | 0.12 | 0.21 | 0.38 | 0.28 | 0.84 |
+
+  Draws a frame by part, and the layer's own counts for the same runs (its
+  line of the third 300-frame period; programs, texture binds, uniforms,
+  attribute pointers and sampler states are a frame's calls; "GPU-indexed"
+  are indexed draws from GPU buffers):
+
+  | | hangemhigh | chillout | damnation | carousel | boardingaction | bloodgulch |
+  |---|---|---|---|---|---|---|
+  | world / objects / transparent / hud | 12 / 15 / 0 / 13 | 51 / 10 / 25 / 13 | 61 / 26 / 2 / 13 | 90 / 36 / 32 / 13 | 99 / 25 / 4 / 13 | 21 / 22 / 1 / 13 |
+  | draws | 40 | 99 | 102 | 171 | 141 | 57 |
+  | programs | 12 | 24 | 36 | 38 | 28 | 15 |
+  | texture binds | 55 | 107 | 169 | 194 | 157 | 89 |
+  | sampler states | 24 | 26 | 37 | 72 | 26 | 18 |
+  | uniforms | 31 | 63 | 93 | 104 | 74 | 54 |
+  | attribute pointers | 284 | 590 | 654 | 983 | 877 | 389 |
+  | GPU-indexed draws | 15 | 10 | 26 | 36 | 25 | 22 |
+  | indices | 6513 | 4420 | 15265 | 14541 | 14044 | 15202 |
+  | draws from client arrays | 0 | 0 | 0 | 0 | 0 | 0 |
+
+  Not verified: the HUD showed 19 to 23 draws in the first windows after
+  the load on hangemhigh (4 windows at 23), bloodgulch (about 10 windows
+  at 15 to 23) and boardingaction (3 windows at 21 to 23), and 13 for the
+  rest of every run; the extra ten are something temporary on the screen
+  at the start (a message; a guess), and in those windows the parts' draws
+  add up to 6 to 10 more than the layer's total, which is not explained.
+  Those windows are left out above. One run of each map; the layer's line
+  per 300 frames was steady within 1 ms between periods.
+
+  What the numbers say:
+
+  1. Hangemhigh's fixed part. Of its 32.5 ms (mean), the three parts that
+     draw (world 5.1, objects 6.5, hud 6.5) are 18.1 ms; the other 14.4 ms
+     is: present 11.2 (78% of it), tick 1.2 (tick objects 0.9), 1.2 ms no
+     phase accounts for (the total minus tick, render, sound and present),
+     render's own rest 0.6 (render sound 0.3, end, setup, flares) and sound
+     0.3. Ranked: present 11.2, tick 1.2, unaccounted 1.2, render rest 0.6,
+     sound 0.3. Present is the big one and it is not a constant: 3.8 ms on
+     chillout, carousel and boardingaction, 6.6 on damnation, 7.3 on
+     bloodgulch, 11.2 here; present plus render is 29.8 here against 39.3
+     (chillout), 53.6 (damnation), 67.7 (carousel), 56.7 (boardingaction)
+     and 33.0 (bloodgulch): the smaller the CPU's drawing part, the longer
+     present takes. That fits present being where the CPU waits for the
+     GPU to finish the frame (a guess; not measured with
+     `HALO_GLES2_FRAME_SPLIT`), which would make the "17 ms fixed" of the
+     cost model partly GPU work that the bigger maps hide behind their
+     draw submission.
+  2. Damnation against Chill Out. Steady means 58.86 against 42.42, 16.44
+     ms. By phase (damnation minus chillout): objects +10.92, world +3.85,
+     present +2.81, tick +1.85 (tick objects +1.68, nodes +0.47, functions
+     +0.36), sound +0.41, render sound +0.40, hud -0.01, transparent
+     -3.68. The objects part holds two thirds of it: 26 draws against 10,
+     14.52 ms against 3.60, 0.56 ms a draw against 0.36. The 16 extra
+     draws at Chill Out's 0.36 explain 5.8 of the 10.9 ms; the other 5.1
+     ms is the dearer draws. The world costs the same per draw in both
+     (23.28/61 = 0.38 and 19.43/51 = 0.38): its +3.85 is its 10 more draws.
+     Chill Out's 25 transparent draws are cheap (0.22 each) and take 3.7
+     ms off the difference. The layer's fields (damnation / chillout, a
+     frame, per draw in brackets): programs 36 / 24 (0.35 / 0.24), texture
+     binds 169 / 107 (1.66 / 1.08), uniforms 93 / 63 (0.91 / 0.64),
+     attribute pointers 654 / 590 (6.4 / 6.0), sampler states 37 / 26,
+     framebuffers 6 / 6, client-array draws 0 / 0, GPU-indexed draws 26 /
+     10 (equal to each map's object draws; the objects are the indexed
+     draws, a guess from the match), indices 15265 / 4420. So damnation's
+     draws change more state (12 more programs, 62 more texture binds, 30
+     more uniforms a frame), its frame has 3.5 times the indices, and its
+     object draws cost 56% more each while its binds per draw are 54% up
+     and its uniforms 42% up: consistent with state changes (or the
+     indices) making the draws dear, not proven; the layer cannot split
+     them by part. Objects elsewhere: hangemhigh 0.43 a draw, bloodgulch
+     0.40, boardingaction 0.47, carousel 0.51. Damnation also has more to
+     tick (3.45 against 1.60 ms) and a longer present (6.6 against 3.8).
+  3. Carousel and Boarding Action by part, draws (ms): carousel world 90
+     (25.7), objects 36 (18.4), transparent 32 (12.5), hud 13 (6.3), 171
+     in all; boarding action world 99 (31.7), objects 25 (11.8),
+     transparent 4 (1.9), hud 13 (6.4), 141 in all. Per draw: carousel
+     world 0.29, objects 0.51, transparent 0.39, hud 0.48; boarding action
+     world 0.32, objects 0.47, transparent 0.48 (4 draws), hud 0.49.
+     Carousel's cost is its 90 world draws and 32 transparent draws;
+     Boarding Action's is its 99 world draws.
+  4. Per draw on these six maps: world 0.29 to 0.38 ms, objects 0.36 to
+     0.56, HUD 0.45 to 0.5 (13 draws; a HUD draw costs more than a world
+     draw).
+
+  Phase 3, task 2: what the 13 HUD draws are. No existing variable can log
+  per-draw state, so nothing was run for it and no code was added.
+  `HALO_GLES2_TRACE=n` logs the mode, count and program of each of the
+  first n draws since the process started (and framebuffer and texture
+  upload calls), with a `glFinish` after each, no texture, no blend, no
+  element, and n would have to reach past the load; `HALO_GLES2_SLOW=ms`
+  (2 or more) logs only draws that take that many ms, which no HUD draw
+  does; `HALO_GLES2_MERGE_STATS` counts a frame's changes as totals,
+  without blend state; `HALO_GLES2_DUMP` only adds program texts to the
+  others; `HALO_PERF_LOG` gives the HUD part's count (13). From the source
+  (`hud_draw.c`, `hud_unit.c`, `hud_weapon.c`, `hud.c`, `motion_sensor.c`,
+  `steamlink_performance.c`):
+
+  | Element | Draw calls it makes (from the source, not measured) |
+  |---|---|
+  | static elements: frames, backgrounds (the shield and health meters' backgrounds, the motion sensor's, weapon icons; `hud_draw_static_element`) | 1 quad each, but none in performance mode: `console_performance_hud_frames()` is false (`display.performance_hud_frames`, default false) and the function returns at once outside cutscenes |
+  | shield meter (`hud_draw_meter`) | 1 quad, plus 1 for each overcharge level above 100% |
+  | health meter (`hud_draw_meter`) | 1 quad |
+  | weapon meters (heat, battery; `hud_draw_meter` in hud_weapon.c) | 1 quad each, if the weapon's interface has them |
+  | numbers: ammo, grenades (`hud_draw_numbers`) | 1 quad (`hud_draw_bitmap_direct`) for each digit drawn, so a two digit number is 2 |
+  | reticle (the weapon interface's crosshair items, `hud_draw_bitmap`) and the weapon overlays (`hud_draw_weapon_overlays`) | 1 quad for each item in the weapon's tag that is on in the weapon's state |
+  | motion tracker (`motion_sensor_draw_screen`: `rasterizer_hud_motion_sensor_blip_begin`, one `..._blip_draw` for each blip, `..._blip_end`) | 1 for each blip; what begin and end draw was not read |
+  | text: messages, names, chat (`rasterizer_draw_string`) | not read: the number of draws for a string is the text renderer's, not the HUD's |
+  | nav points, damage indicators, timers | 1 quad each while on |
+
+  Every quad goes through `rasterizer_psuedo_dynamic_screen_quad_draw`
+  (from `hud_draw_bitmap_internal`) with the framebuffer blend function
+  alpha-multiply-add and the element's bitmap as its texture. Whether
+  that is one GL draw per quad in the layer was not verified (the HUD
+  part's steady 13 at the spawn fits). Which of the 13 are which, and
+  which consecutive ones share program, texture and blend state, cannot be
+  said from the source. The guess: the digits of one number are sprites of
+  one bitmap and the items of one overlay of another, so each number and
+  each overlay could be one draw; the meters use the meter shader and
+  would not merge with them. To get the real list, the layer would need a
+  log of program, texture 0 and blend state for each draw inside the HUD
+  part (a few lines in `gles2_layer.c`; not added).
+
 ### Phase 4. Campaign
 
 - Measure gameplay, not the opening cutscene, on a30, b30, c10, a50, b40,
@@ -203,6 +431,82 @@ Ideas taken from the other ports, to be measured one at a time:
   need their own, milder, profile: decals, dynamic lights and specular off,
   full view distance kept.
 - Peak memory: d40 reaches 192 MB.
+
+
+Measured 2026-11-14 (round 2), 848x480, no `HALO_PERF_LOG`, from the start
+of the map, with `HALO_SCREENSHOT_EVERY=250`: the game's own frame (320x240)
+saved every 250 frames as `frameNNNNN.bmp` in `HALO_SCREENSHOT_DIR`
+(`d3d8_gl.c`, `D3DDevice_Present`; run.sh sets the folder, launch.env here
+set another so the stick's old shots were left alone), converted with
+`tools/box/bmp2png.py` and looked at. A picture is a cutscene when it has
+the 30-pixel black bars at top and bottom and no HUD (checked for every
+picture by whether the top 22 and bottom 22 rows are black), gameplay when
+the shield and ammo HUD shows. a30 and b30 ran 480 s, the others 300 s.
+The frame number of a picture is matched to the layer's "frames N to M took"
+lines by taking the two frame counts as the same (not verified; the changes
+of draws in the log fall where the pictures change). The seconds below are
+counted from the layer's frame 30, so the map's own load before it is not
+in them. Pictures: `docs/shots/campaign/` (two or three a map, 320x240).
+
+| Map | Peak MB | Cutscene | Gameplay starts | Gameplay windows ("frames N to M": ms a frame, draws) |
+|---|---|---|---|---|
+| a30 | 173 | frames 250 and 500 (to about 120 s) | between frame 500 and 750 (about 120 to 170 s) | 930-1230: 184.1, 340; 1230-1530: 179.0, 340; 1530-1830: 178.6, 340; 1830-2130: 181.7, 340 |
+| b30 | 185 | frames 250 and 500 (to about 130 s) | between frame 500 and 750 (130 to 190 s) | none whole: 630-930 (279.5, 399) holds the end of the cutscene and the start of play; the game crashed (below) |
+| c10 | 182 | frames 250 and 500 (to about 140 s) | between frame 500 and 750 (140 to 180 s) | 930-1230: 102.1, 160; 1230-1530: 90.0, 148; 1530-1830: 89.7, 145 |
+| a50 | 198 | frames 250 and 500 (to about 120 s) | between frame 500 and 750 (120 to 155 s) | 930-1230: 104.8, 120; 1230-1530: 105.5, 131; 1530-1830: 109.0, 137 (the last two include pictures with no HUD, below) |
+| c40 | 165 | all of the run: frames 250 to 1750 (8 pictures) have the bars and no HUD | does not start in 300 s | none; the cutscene's windows: 630-930: 112.9, 176; 930-1230: 107.9, 161; 1230-1530: 105.3, 149; 1530-1830: 147.1, 235 |
+| d20 | 175 | frames 250, 500 and 750 (to about 150 s) | between frame 750 and 1000 (150 to 190 s) | 930-1230: 87.4, 151 (starts in it); 1230-1530: 95.2, 175; 1530-1830: 94.9, 178 |
+
+The earlier windows of each run (30-330, 330-630) are the load and the
+opening cutscene (a30: 313.5 ms with 16 draws, then 165.5 ms with 323;
+the same two windows on the others are in the round 1 table above).
+
+What the pictures show:
+
+- a30: black (frame 0), two cutscene pictures (the ridge and the Pelican's
+  cockpit), then the player in a corridor of the ship with the HUD
+  (shield bar, ammo, grenades, reticle), the same view standing still from
+  frame 750 to 2250 (7 pictures): gameplay was reached and the player was
+  not moved, so what is measured is a still view of one place: 340 draws,
+  179 to 184 ms, 61 programs, 527 texture binds, 127840 indices a frame
+  (the last period). Round 1's reading "a30 stayed in the cutscene" was
+  wrong.
+- b30: the same shape (two bars pictures, then gameplay with HUD at frame
+  750 on a beach with smoke). It crashed: `gles2: bus error at 0xbec83d35,
+  pc 00ec3844 lr 010ca268` at 335 s (the sweep reported ENDED at 335 s),
+  after frame 930 and before 1230. `llvm-symbolizer` on the unstripped
+  build gives pc in `actor_move_try_evasion_vector` (`actor_moving.c`:
+  1232) and lr in `collision_surface_project_point2d` (`collision_bsp.c`:
+  829): an AI evasion step in a collision test; the faulting address is
+  odd (an unaligned access: a guess at the cause, not investigated). The
+  layer's last period before it: 399 draws, 99 programs, 848 texture
+  binds, 100529 indices, 11 client-array draws. Not repeated, so whether
+  it recurs is not known; b30 has no gameplay number.
+- c10: two bars pictures, then play in the jungle with the HUD from frame
+  750 (5 pictures to 1750), the camera turning (leaves in view in the
+  later ones): 160, 148 and 145 draws, 102 to 90 ms.
+- a50: two bars pictures (the second with the caption "Truth and
+  Reconciliation"), then play with the HUD at frames 750 to 1250 (the
+  objective "Board the Covenant Battle Cruiser" shown), and at frames
+  1500 and 1750 a close picture of a character with no HUD meters and no
+  bars (the second with the hint "Use [button] when zoomed in to activate
+  night vision"): a body or a first-person death view; a guess, it was
+  not checked further. Draws and ms are about the same across those
+  windows (120 to 137, 105 to 109 ms).
+- c40: every picture is a cutscene (a dark approach, a pale platform hall,
+  a green character and a floating sphere); 300 s were not enough to reach gameplay. Round 1's
+  guess that c40 was gameplay was wrong.
+- d20: three dark bars pictures (rock face, sparks), then gameplay with
+  the HUD from frame 1000 ("Find a way into the control room"), the player
+  standing still with projectiles in view.
+
+Gameplay, in short: a30 about 180 ms and 340 draws (the worst, standing
+in the ship's interior), a50 105 to 109 ms and 120 to 137 draws, d20 87 to
+95 ms and 151 to 178 draws, c10 90 ms and 145 to 148 draws. The goal of
+50 ms is far off on all four (1.8 to 3.6 times); only the d40 map from
+round 1 (56 ms) is near it. The three campaign maps not reached or
+measured (b30 crash, c40 cutscene) still need a run: c40 needs more than
+300 s, b30 needs a repeat. b40 and c20 were not run again.
 
 ### Phase 5. Memory (target: under 170 MB everywhere)
 
