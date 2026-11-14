@@ -569,6 +569,180 @@ What the round's numbers say, and what follows from them:
   the three of them. Upstream should have it; other byte-array records in
   the decompiled sources are the same risk on this CPU.
 
+## Round 3 (2026-11-14)
+
+Build: the rebuilt game with the aligned path-collision patch, installed by
+`tools/box/deploy.sh` (box md5 3f1af6e32feaee037cd86879d45bf4cf; run.sh on the
+box has EGL_MVGFX_W=848 and EGL_MVGFX_H=480). 848x480, one run per cell,
+started with `init.txt` by `sweep.sh`, environment through `launch.env`.
+"ran" means the game was still alive at the time limit and was killed by
+the script. Windows are the layer's "frames N to M took" lines. Runs with
+`HALO_GLES2_FRAME_SPLIT` or `HALO_GLES2_MERGE_STATS` are not compared with
+runs without (each adds work).
+
+### Task 1: b30 and the wider crash check (no environment variables)
+
+No run printed `bus error`, `crash report`, `Assertion` or `halt` (grepped
+in every log); every run was alive at its limit.
+
+| Map | Limit | Ended | Peak MB | Windows after about frame 750: "frames N to M": ms a frame, draws |
+|---|---|---|---|---|
+| b30, run 1 | 480 s | ran | 186 | 630-930: 273.9, 396; 930-1230: 185.6, 237; 1230-1530: 135.9, 123; 1530-1830: 128.2, 92; 1830-2130: 124.5, 79; 2130-2430: 112.0, 77; 2430-2730: 106.9, 75 |
+| b30, run 2 | 480 s | ran | 178 | 630-930: 215.3, 273; 930-1230: 142.5, 143; 1230-1530: 126.7, 100; 1530-1830: 122.2, 79; 1830-2130: 114.5, 78; 2130-2430: 107.8, 76; 2430-2730: 102.6, 76; 2730-3030: 96.5, 74 |
+| b40 | 300 s | ran | 199 | 930-1230: 72.1, 105; 1230-1530: 67.6, 101; 1530-1830: 99.4, 117; 1830-2130: 60.1, 92; 2130-2430: 86.2, 113; 2430-2730: 71.6, 100 |
+| c20 | 300 s | ran | 175 | 930-1230: 79.0, 129; 1230-1530: 78.1, 128; 1530-1830: 77.8, 129; 1830-2130: 77.1, 128; 2130-2430: 78.5, 132; 2430-2730: 78.5, 129; 2730-3030: 78.3, 129 |
+| d40 | 300 s | ran | 200 | 930-1230: 51.5, 97; 1230-1530: 51.1, 51; 1530-1830: 61.6, 58; 1830-2130: 56.6, 66; 2130-2430: 56.6, 68; 2430-2730: 59.7, 66; 2730-3030: 50.8, 55; 3030-3330: 56.4, 71; 3330-3630: 59.7, 69 |
+| a10 | 300 s | ran | 175 | 930-1230: 107.6, 193; 1230-1530: 84.2, 149; 1530-1830: 74.1, 97; 1830-2130: 64.4, 61; 2130-2430: 82.5, 103; 2430-2730: 97.1, 114 |
+
+b30 passed 335 s, where round 2 crashed, in both runs (both lasted until
+the script's 480 s). Two runs is not proof the crash is gone. b30's play is
+96 to 136 ms a frame with 74 to 123 draws once the opening settles (the
+windows around frame 930 are 142 to 186 ms with 143 to 237 draws, the
+cutscene's tail and the start of play). Where gameplay began on the other
+maps was not checked with pictures. b40 peaked at 199 MB and d40 at 200 MB
+(192 in round 1); the 170 MB memory goal is missed on b30, b40, d40, a10 and c20.
+
+### Task 2: where present's time goes (`HALO_GLES2_FRAME_SPLIT`)
+
+What it measures (gles2_layer.c, in the blit to the screen): after the
+frame's last draw it calls `glFinish`, adds the time that call took to a
+counter, and every 300 frames logs the counter divided by 300 ("of which N
+ms waiting for the GPU at the frame's end"). The frame time is then taken
+after the finish. It says nothing about the frame before that point, and
+the first period's figure includes the load's frames (the counter starts
+at frame 1, the divisor is 300), so the first line of each run is left
+out. 120 s a map; carousel reached only three windows.
+
+Verbatim steady lines (the calls part of each "took" line is cut after the
+draws):
+
+- hangemhigh: `gles2: frames 330 to 630 took 32.3 ms each; a frame's calls: 40 draws ...` / `gles2: of which 9.1 ms waiting for the GPU at the frame's end`
+- hangemhigh: `gles2: frames 630 to 930 took 33.7 ms each; ...` / `gles2: of which 9.1 ms waiting for the GPU at the frame's end`
+- hangemhigh: `gles2: frames 930 to 1230 took 32.3 ms each; ...` / `gles2: of which 9.2 ms waiting for the GPU at the frame's end`
+- bloodgulch: `gles2: frames 630 to 930 took 39.1 ms each; a frame's calls: 57 draws ...` / `gles2: of which 6.1 ms waiting for the GPU at the frame's end`
+- bloodgulch: `gles2: frames 930 to 1230 took 38.9 ms each; ...` / `gles2: of which 6.0 ms waiting for the GPU at the frame's end`
+- bloodgulch: `gles2: frames 1230 to 1530 took 38.7 ms each; ...` / `gles2: of which 6.0 ms waiting for the GPU at the frame's end`
+- carousel: `gles2: frames 330 to 630 took 71.6 ms each; a frame's calls: 171 draws ...` / `gles2: of which 2.1 ms waiting for the GPU at the frame's end`
+- carousel: `gles2: frames 630 to 930 took 71.3 ms each; ...` / `gles2: of which 2.1 ms waiting for the GPU at the frame's end`
+  (two steady lines only; the load window 30 to 330 said 172.6 and 2.6)
+
+| Map | Draws | ms a frame (steady) | Waiting for the GPU, ms | Share of the frame | Rest, ms |
+|---|---|---|---|---|---|
+| hangemhigh | 40 | 32.3 to 33.7 (mean of 3: 32.8) | 9.1 to 9.2 | 28% | 23.7 |
+| bloodgulch | 57 | 38.7 to 39.1 (mean 38.9) | 6.0 to 6.1 | 15% | 32.9 |
+| carousel | 171 | 71.3 and 71.6 | 2.1 | 3% | 69.3 |
+
+Round 2's present (another run, with `HALO_PERF_LOG`): hangemhigh 11.2,
+bloodgulch 7.3, carousel 3.8 ms; the wait is 81%, 82% and 55% of those. The
+frame times here match the unsplit ones in the tables above (32 to 34, 39,
+71), so the extra `glFinish` did not visibly slow the frame.
+
+Reading: the wait falls as the map gets heavier (9.1, 6.0, 2.1 ms), which
+fits "the CPU waits for the GPU only when it has little else to do" and
+explains most of present's variation. It does not support "light maps are
+GPU-bound": even hangemhigh, the lightest, spends 72% of its frame not
+waiting; the wait is 9 ms of 32.8 and the other 23.7 ms is CPU work. So the
+GPU's finish is a tail of 2 to 9 ms that only the light maps show, on top of
+the CPU's work. Cutting draws on a light map shortens the CPU part but
+the tail may grow in step (a guess; not tested; this run cannot say how
+much GPU work overlaps the CPU's). That heavy maps are driver-bound is
+consistent (2 ms of 71 waiting), but the driver's own share is not measured
+here, only the wait at the end. `glFinish` may also include driver work
+for draws still queued (a guess).
+
+### Task 3: which draws could merge (`HALO_GLES2_MERGE_STATS`)
+
+What it logs: for each draw, what changed from the draw before, tested in
+this order and counted under the first that applies: framebuffer, program,
+textures bound on any unit, uniforms (a constant counts only if its value
+changed), vertex attribute pointers ("vertices only"), nothing. Blend,
+depth and other render state are not looked at, so "vertices only" and
+"nothing" are the most that could merge. It also counts constants written
+and how many were written with the value the program already held. It
+counts the whole frame and cannot say which part of the frame (world,
+objects, HUD) a draw is in: there is no per-part figure. The counters start
+at frame 1, so the first line of each run (the load) is left out. 120 s a
+map; the steady lines of a map are the same.
+
+Verbatim, two steady lines a map (frames 630 to 930, then 930 to 1230):
+
+- bloodgulch, both: `gles2: a frame's draws by what changed first: framebuffer 3, program 13, textures 24, uniforms 1, vertices only 16, nothing 0; 2327 constants written, 947 to the value they had`
+- damnation, first: `gles2: a frame's draws by what changed first: framebuffer 3, program 34, textures 38, uniforms 1, vertices only 26, nothing 0; 3614 constants written, 1531 to the value they had`; second the same with `3615 constants written, 1534 to the value they had`
+- carousel, first: `gles2: a frame's draws by what changed first: framebuffer 3, program 36, textures 68, uniforms 10, vertices only 54, nothing 0; 4234 constants written, 2035 to the value they had`; second the same with `4233 constants written, 2036 to the value they had`
+
+| A frame's draws that change first... | bloodgulch | damnation | carousel |
+|---|---|---|---|
+| framebuffer | 3 | 3 | 3 |
+| program | 13 | 34 | 36 |
+| textures (program the same) | 24 | 38 | 68 |
+| uniforms only | 1 | 1 | 10 |
+| vertices only | 16 | 26 | 54 |
+| nothing | 0 | 0 | 0 |
+| total (the layer's draws) | 57 | 102 | 171 |
+| vertices only, share of draws | 28% | 25% | 32% |
+| vertices only or uniforms only, share | 30% | 26% | 37% |
+| constants written a frame / of them to the value held | 2327 / 947 (41%) | 3614 / 1531 (42%) | 4234 / 2035 (48%) |
+
+Ms a frame in these runs (stats on; not comparable with others):
+bloodgulch 37.4 to 39.5, damnation 57.3 to 58.1, carousel 72.1 to 74.0.
+
+Reading: draws that change only vertices are a quarter to a third, which
+agrees with the earlier "at most a quarter" (a little more on carousel);
+they would also have to share blend and depth state to merge, which is not
+checked, so the real figure is lower. Most draws change a texture (24, 38,
+68) or the program. Not measured: which draws these are, and the count by
+part of the frame.
+
+### Task 4: view distance outdoors
+
+Source check: `chupathingyce/port/linux/src/port_config.c` line 382 is
+`{ "display.performance_view_distance", _config_real, "60.0", "HALO_PERFORMANCE_VIEW_DISTANCE",`
+with `_environment_value` on the next line, and the loop at about line 4797
+sets each `_environment_value` setting from its variable over the file's
+value (`config_set_from_text`). `steamlink_performance.c` line 126 returns
+`config_real("display.performance_view_distance")` from
+`console_performance_view_distance()`. So the variable overrides the
+setting. (The directory `chupathingyce/platform` does not exist; the source
+is under `chupathingyce/port/linux/src`.) `config.toml` was not touched.
+
+848x480, no other variables, 120 s (bloodgulch, beavercreek) and 300 s
+(a30), one run each. ms a frame is the mean of the last three steady
+windows. a30 has only one window after frame 930 in 300 s (it loads
+slowly), so that one window is given, not a mean:
+
+| Map | 30 | 60 (default) | 120 |
+|---|---|---|---|
+| bloodgulch | 35.0 ms, 48 draws | 38.4 ms, 57 draws | 46.0 ms, 69 draws |
+| beavercreek | 31.0 ms, 51 draws | 31.0 ms, 51 draws | 30.9 ms, 51 draws |
+| a30 (window 930-1230) | 156.4 ms, 259 draws | 179.4 ms, 340 draws | 205.2 ms, 406 draws |
+
+Peak MB: bloodgulch 149, 149, 157; beavercreek 150, 159, 150; a30 174 (30),
+166 (60), 166 (120). Bloodgulch's last three windows: 34.9, 35.0, 35.0 at
+30; 38.2, 38.4, 38.7 at 60; 45.7, 45.8, 46.5 at 120. Beavercreek's draws
+were 51 at every distance.
+
+So outdoors the distance matters: bloodgulch gains 3.4 ms from 60 to 30
+(and loses 7.6 at 120), a30 gains 23 ms (13%) with 81 fewer draws at 30;
+beavercreek is not affected at all (reason not checked). Not measured: how
+30 looks (no screenshots this round, so the visual cost, and pop-in, are
+not judged), other maps, and more than one run a cell, so a difference of
+1 ms is not meaningful. a30's window is a still view of one place, and
+930-1230 may hold a little of the move into play (round 2's later windows
+at 60 were steady at 340 draws, which this run matches).
+
+### What was not measured or not verified
+
+- Whether the b30 crash is gone: two clean 480 s runs only.
+- Gameplay was not confirmed by screenshot on b30, b40, c20, d40 or a10.
+- Frame split: only the end-of-frame wait, not the driver's share or what
+  the GPU does while the CPU draws; carousel has two steady lines.
+- Merge stats: whole frame only, no blend or depth state, no part of frame.
+- View distance: no pictures, one run a cell, a30 one window.
+- The scripts overwrite `/mnt/scratch/sweep-<map>.log`, so the box's older
+  logs of a30, b30, b40, c20, d40, beavercreek, bloodgulch, carousel,
+  damnation and hangemhigh were replaced by these runs' (which were then
+  removed after fetching).
+
 ## Do not retry (measured, no gain or worse)
 
 - `VIV_NO_MT=1`: frames went from 42 to 69 ms and the game would not quit.
