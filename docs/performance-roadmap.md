@@ -529,6 +529,46 @@ translated shader text, 2.7 MB the ring screens' pictures (never freed),
   port ships it; about 1 ms here).
 - Release build, update test from 0.9.1 on a local server, then publish.
 
+## Decisions after round 2 (2026-11-14)
+
+What the round's numbers say, and what follows from them:
+
+- A draw is not one price. World draws cost 0.29 to 0.38 ms, object draws
+  0.36 to 0.56, HUD quads 0.48, Chill Out's transparent draws 0.22. Objects
+  and the HUD are the dear ones; count them first.
+- `present` is 3.8 ms when the frame is busy and up to 11 ms when it is not
+  (Hang 'Em High). The likeliest reading is that the CPU waits there for
+  the GPU, so the light maps are GPU-bound and the heavy ones driver-bound.
+  To prove: `HALO_GLES2_FRAME_SPLIT` on hangemhigh and carousel. If true,
+  cutting draws on a map already near 33 ms buys less than its draw count
+  says, and those maps want fewer pixels or cheaper shaders instead.
+- View distance below 60 does nothing at the four indoor spawns. Per-map
+  view distance is dropped from phase 3 unless the outdoor run (bloodgulch,
+  sidewinder away from the wall, a30) shows otherwise.
+- Order of building, by ms a map for the work:
+  1. HUD in one pass (6.2 ms on every map, 13 quads). First merge quads
+     that share bitmap and blend (digits, overlay items), which needs no
+     new render target. Only if that leaves more than 3 ms, the resident
+     HUD: drawn into an RGBA texture whose alpha holds what the HUD lets
+     through (`glBlendFuncSeparate` with alpha ZERO / the colour's own
+     destination factor, cleared to alpha 1), put on the frame with
+     ONE / SRC_ALPHA, redrawn every third frame. That is exact for the
+     HUD's alpha and additive blends.
+  2. Object draws on damnation, carousel and boardingaction (12 to 18 ms):
+     find what the 25 to 36 are (weapons and pickups at rest are the
+     guess) and whether the bone constants are sent for unskinned ones.
+  3. Carousel's 32 transparent draws (12.5 ms).
+- Campaign is far from 20 fps: gameplay is 90 ms on c10 and d20, 105 on
+  a50 and 180 on a30 (340 draws, 127840 indices a frame). No single item
+  above closes that; the goal for campaign in this release is "runs and
+  does not crash", and its frame rate is a later roadmap.
+- b30 crashed (bus error) at 335 s: `actions.c` kept a
+  `path_collision_result` in a `byte` array, which the ARM compiler may
+  put at an odd address, and reading its reals from there faults.
+  `patches/chupathingyce/0002-aligned-path-collision-result.patch` aligns
+  the three of them. Upstream should have it; other byte-array records in
+  the decompiled sources are the same risk on this CPU.
+
 ## Do not retry (measured, no gain or worse)
 
 - `VIV_NO_MT=1`: frames went from 42 to 69 ms and the game would not quit.
