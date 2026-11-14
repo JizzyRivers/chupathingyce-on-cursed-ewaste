@@ -743,6 +743,36 @@ at 60 were steady at 340 draws, which this run matches).
   damnation and hangemhigh were replaced by these runs' (which were then
   removed after fetching).
 
+## Decisions after round 3 (2026-11-14)
+
+- The b30 bus error did not come back in two 480 s runs with patch 0002,
+  and b40, c20, d40 and a10 ran 300 s clean. Two runs are not proof; keep
+  b30 in every later crash check.
+- The wait for the GPU at the frame's end is 9 ms on hangemhigh, 6 on
+  bloodgulch and 2 on carousel: a tail on top of the CPU's work, not a
+  GPU-bound frame. Cutting draws still pays everywhere, a little less on
+  the lightest maps.
+- Per-map view distance is back, for outdoor maps only: 60 to 30 is 3.4 ms
+  on bloodgulch (57 to 48 draws) and 23 ms on a30 (340 to 259), nothing on
+  beavercreek or the indoor maps. Before it becomes a default it needs
+  pictures at 30 and 45 to judge the pop-in, and it is a table by map
+  (the 3DS port's way), not one value.
+- Merging by "nothing changed but vertices" covers at most 25 to 32% of a
+  frame's draws, less once blend and depth are compared. It is worth
+  building only where the draws are dear and adjacent: the HUD's quads.
+  The stats cannot say which part a draw is in, so the next piece of code
+  is that: the part's name (the perf log's phase) on each merge-stats
+  line, then the HUD merge itself.
+- 41 to 48% of constant writes repeat the value held. Skipping them was
+  measured before with no gain: stays in "do not retry".
+- Memory: every campaign level run peaks at 175 to 200 MB against the
+  170 MB goal. Phase 5's items (ring pictures, shader text, the map index
+  document) are worth about 15 MB together, so they come before release.
+
+Next to build, in order: (1) HUD quads merged; (2) outdoor view distance
+table with pictures; (3) phase 5's three frees; (4) object draws on
+damnation, carousel and boardingaction.
+
 ## Do not retry (measured, no gain or worse)
 
 - `VIV_NO_MT=1`: frames went from 42 to 69 ms and the game would not quit.
