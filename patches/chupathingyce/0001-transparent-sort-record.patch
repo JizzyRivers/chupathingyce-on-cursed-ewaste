@@ -1,0 +1,24 @@
+diff --git a/source/rasterizer/xbox/rasterizer_xbox_models.c b/source/rasterizer/xbox/rasterizer_xbox_models.c
+index fb6c85733..f3f1eaa43 100644
+--- a/source/rasterizer/xbox/rasterizer_xbox_models.c
++++ b/source/rasterizer/xbox/rasterizer_xbox_models.c
+@@ -2533,6 +2533,19 @@ struct transparent_geometry_group *_rasterizer_model_transparent_geometry_submit
+ 	boolean alpha_blended_decal;
+ 	boolean submit_decals;
+ 
++	/* port: the sort record says no group unless a queued group is made
++	below: a decal drawn at once (the immediate group) or a draw that is
++	left out set none, and render_model (models.c) linked the record as it
++	was left, a part before's or another model's, writing through its
++	pointers (a crash at a null one in a network game, and the heap's
++	corruption in Stubbs mode) */
++	if (sort_filth)
++	{
++		sort_filth->group_index = NONE;
++		sort_filth->previous_group_presorted_index_reference = NULL;
++		sort_filth->next_group_presorted_index_reference = NULL;
++	}
++
+ 	if (rasterizer_debug_options.draw_models &&
+ 		rasterizer_debug_options.draw_model_transparent_geometry)
+ 	{

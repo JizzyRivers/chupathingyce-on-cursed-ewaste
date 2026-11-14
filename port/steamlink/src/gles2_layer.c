@@ -109,6 +109,8 @@ static void layer_once(int *said, const char *format, ...)
 static struct
 {
 	unsigned long draws, texture_parameters, texture_binds, uniforms, programs, pointers, framebuffers, links, compiles, gpu_indexed;
+	/* draws with vertices the driver copies (client arrays), their vertices' bytes, and indexed draws' indices */
+	unsigned long client_draws, client_bytes, index_count;
 } counts;
 
 /* (every draw since the start, for HALO_PERF_AB and the frame timing log,
@@ -1878,6 +1880,39 @@ static void GL_APIENTRY layer_DrawArrays(GLenum mode, GLint first, GLsizei count
 	draw_flush_maybe();
 }
 
+/* (for the log: whether an indexed draw's vertices are client arrays, which
+the driver copies to the GPU each draw, and how many bytes of them) */
+static void client_vertices_count(GLenum type, const void *indices, GLsizei count)
+{
+	const struct layer_vertex_array *array = vertex_array();
+	unsigned long lowest = 0, highest = 0, bytes = 0;
+	int ranged = 0;
+	GLuint index;
+
+	for (index = 0; index < (GLuint)attribute_maximum && index < LAYER_ATTRIBUTES; index++)
+	{
+		const struct layer_attribute *attribute = &array->attributes[index];
+		const struct layer_buffer *buffer;
+
+		if (!(array->enabled & (1u << index)))
+			continue;
+		buffer = buffer_get(attribute->buffer);
+		if (buffer && buffer->gpu)
+			continue;
+		if (!ranged)
+		{
+			index_range(type, indices, count, &lowest, &highest);
+			ranged = 1;
+		}
+		bytes += (highest - lowest + 1) * (unsigned long)(attribute->stride ? attribute->stride : 16);
+	}
+	if (ranged)
+	{
+		counts.client_draws++;
+		counts.client_bytes += bytes;
+	}
+}
+
 static void GL_APIENTRY layer_DrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
 	merge_stats_draw(program_current);
@@ -1924,6 +1959,8 @@ static void GL_APIENTRY layer_DrawElements(GLenum mode, GLsizei count, GLenum ty
 
 			GLsizei drawn = (experiment_bits & 128) && count > 3 ? 3 : count;
 
+			counts.index_count += (unsigned long)drawn;
+			client_vertices_count(type, indices, drawn);
 			if (elements && elements->gpu)
 			{
 				counts.gpu_indexed++;
@@ -2332,6 +2369,36 @@ static void GL_APIENTRY layer_BlitFramebuffer(GLint source_x0, GLint source_y0, 
 				counts.uniforms / 300, counts.pointers / 300, counts.framebuffers / 300,
 				counts.gpu_indexed / 300, counts.links,
 				counts.compiles);
+			/* (where the memory is: the C heap, its large blocks, and the
+			layer's own copies of the renderer's buffers) */
+			{
+				/* (glibc's, declared here: the port's headers stand in front
+				of malloc.h) */
+				struct layer_mallinfo { int arena, ordblks, smblks, hblks, hblkhd, usmblks, fsmblks, uordblks, fordblks, keepcost; };
+				extern struct layer_mallinfo mallinfo(void);
+				struct layer_mallinfo heap = mallinfo();
+				unsigned long copies = 0, copied_bytes = 0, aliased = 0, with_gpu = 0;
+				GLuint name;
+
+				for (name = 1; name < LAYER_TRACKED; name++)
+				{
+					if (!buffers[name].data)
+						continue;
+					if (buffers[name].aliased)
+						aliased++;
+					else
+					{
+						copies++;
+						copied_bytes += buffers[name].size > 0 ? (unsigned long)buffers[name].size : 0;
+					}
+					with_gpu += buffers[name].gpu != 0;
+				}
+				platform_log("gles2: memory: heap %d KB in use of %d, large blocks %d KB in %d; the layer's buffers: "
+					"%lu copies of %lu KB, %lu aliased, %lu with a GPU copy", heap.uordblks / 1024, heap.arena / 1024,
+					heap.hblkhd / 1024, heap.hblks, copies, copied_bytes / 1024, aliased, with_gpu);
+				platform_log("gles2: a frame's vertices: %lu draws from client arrays (%lu KB the driver copies), %lu indices",
+					counts.client_draws / 300, counts.client_bytes / 300 / 1024, counts.index_count / 300);
+			}
 			if (finish_ms)
 				platform_log("gles2: of which %.1f ms waiting for the GPU at the frame's end", (double)finish_ms / 300.0);
 			if (merge_stats_on > 0)
@@ -2560,6 +2627,9 @@ struct layer_shader
 	int attribute_count;
 	char attribute_names[LAYER_ATTRIBUTES][32];
 	GLint attribute_locations[LAYER_ATTRIBUTES];
+	/* compiled only when a program with it is linked from its source, not
+	loaded as a binary (program_binaries) */
+	int deferred;
 	/* a skinned shader's node indices: the attribute (v<n>) and the constant
 	(c[<k>].w) its a0 is taken from, and its weights' attribute (the first
 	node's in x, both's sum in w), -1 for none (bones_window_apply) */
@@ -3507,10 +3577,21 @@ static void GL_APIENTRY layer_ShaderSource(GLuint shader, GLsizei count, const G
 
 /* a shader that does not compile: its error and its translated source in
 the log (the first few) */
+static int program_binaries_on(void);
+
 static void GL_APIENTRY layer_CompileShader(GLuint shader)
 {
 	static int reported;
 	GLint compiled = 0;
+
+	/* (with the programs' binaries kept, compiled at its program's link,
+	if that finds no binary: layer_LinkProgram) */
+	if (shader && shader < LAYER_TRACKED && shaders[shader].source && program_binaries_on())
+	{
+		shaders[shader].deferred = 1;
+		counts.compiles++;
+		return;
+	}
 
 	/* (HALO_GLES2_DUMP_ALL=folder: every shader as the driver gets it) */
 	if (getenv("HALO_GLES2_DUMP_ALL") && shader < LAYER_TRACKED && shaders[shader].source)
@@ -3673,19 +3754,27 @@ static GLuint fragment_specialized(GLuint fragment, unsigned int unwritten)
 		real.ShaderSource(shader, 1, &source, NULL);
 	}
 	counts.compiles++;
-	real.CompileShader(shader);
-	if (!get_shaderiv)
-		get_shaderiv = (__typeof__(get_shaderiv))SDL_GL_GetProcAddress("glGetShaderiv");
-	get_shaderiv(shader, GL_COMPILE_STATUS, &compiled);
-	if (!compiled)
+	/* (with the programs' binaries kept, compiled only at a link that finds
+	no binary, as the renderer's own: layer_LinkProgram goes back to the
+	shader with its divides should it not do then. Compiled at each start,
+	these were 19 of its 63 seconds) */
+	if (!program_binaries_on())
 	{
-		LAYER_ONCE("a pixel shader without its divides does not compile: the divides are kept");
-		free(text.buffer);
-		return 0;
+		real.CompileShader(shader);
+		if (!get_shaderiv)
+			get_shaderiv = (__typeof__(get_shaderiv))SDL_GL_GetProcAddress("glGetShaderiv");
+		get_shaderiv(shader, GL_COMPILE_STATUS, &compiled);
+		if (!compiled)
+		{
+			LAYER_ONCE("a pixel shader without its divides does not compile: the divides are kept");
+			free(text.buffer);
+			return 0;
+		}
 	}
 	free(shaders[shader].source);
 	shaders[shader].source = text.buffer;
 	shaders[shader].type = GL_FRAGMENT_SHADER;
+	shaders[shader].deferred = program_binaries_on();
 	if (specialized_count < (int)(sizeof(specialized) / sizeof(*specialized)))
 	{
 		specialized[specialized_count].fragment = fragment;
@@ -3728,10 +3817,193 @@ static void program_dump(GLuint program, const char *tag)
 struct constant_split;
 static struct constant_split *constant_split[LAYER_TRACKED];
 
+/* ---------- program binaries
+
+The renderer keeps its shaders' texts (xgpu_shader_cache.c) and at every
+start compiles them all and links every pair, made for desktop drivers that
+compile in parallel: on the box's one core and Vivante's compiler, 209
+shaders and 160 programs took a minute at each start, and longer as more
+maps are played (26 seconds with their binaries: 11 the driver's loads, 6
+the texts' translation). The driver has GL_OES_get_program_binary: each program
+linked from its texts is kept as the driver's binary, in gles2_programs in
+the save folder, under a hash of its two texts and its attributes' places;
+the next link of the same finds it and loads it, its shaders never compiled
+(layer_CompileShader leaves a shader for its link). A binary the driver no
+longer takes (a new driver) is linked from its texts again, and kept anew.
+HALO_GLES2_NO_BINARIES: none kept, every shader compiled as asked. */
+
+#define PROGRAM_BINARY_VERSION "gles2 program 1"
+
+static struct
+{
+	int state;
+	char folder[1024];
+	void (GL_APIENTRY *get)(GLuint, GLsizei, GLsizei *, GLenum *, void *);
+	void (GL_APIENTRY *load)(GLuint, GLenum, const void *, GLint);
+	unsigned long loaded, saved, linked;
+} program_binaries = { -1 };
+
+static int program_binaries_on(void)
+{
+	if (program_binaries.state < 0)
+	{
+		const char *root = getenv("HALO_SAVE_ROOT");
+
+		program_binaries.state = 0;
+		if (!root || !*root || getenv("HALO_GLES2_NO_BINARIES") || !host_gl_has_extension("GL_OES_get_program_binary"))
+			return 0;
+		program_binaries.get = (__typeof__(program_binaries.get))SDL_GL_GetProcAddress("glGetProgramBinaryOES");
+		program_binaries.load = (__typeof__(program_binaries.load))SDL_GL_GetProcAddress("glProgramBinaryOES");
+		snprintf(program_binaries.folder, sizeof(program_binaries.folder), "%s/gles2_programs", root);
+		SDL_CreateDirectory(program_binaries.folder);
+		program_binaries.state = program_binaries.get && program_binaries.load;
+		platform_log("gles2: programs %s", program_binaries.state ? "kept as the driver's binaries" :
+			"not kept (no binary calls)");
+	}
+	return program_binaries.state;
+}
+
+static unsigned long long program_hash_add(unsigned long long hash, const void *data, size_t length)
+{
+	const unsigned char *bytes = data;
+	size_t index;
+
+	for (index = 0; index < length; index++)
+		hash = (hash ^ bytes[index]) * 0x100000001b3ULL;
+	return hash;
+}
+
+/* the hash of a program's two texts and its attributes' places */
+static unsigned long long program_key(GLuint vertex, GLuint fragment)
+{
+	unsigned long long hash = 0xcbf29ce484222325ULL;
+	int index;
+
+	hash = program_hash_add(hash, PROGRAM_BINARY_VERSION, sizeof(PROGRAM_BINARY_VERSION));
+	hash = program_hash_add(hash, shaders[vertex].source, strlen(shaders[vertex].source) + 1);
+	hash = program_hash_add(hash, shaders[fragment].source, strlen(shaders[fragment].source) + 1);
+	for (index = 0; index < shaders[vertex].attribute_count; index++)
+	{
+		hash = program_hash_add(hash, shaders[vertex].attribute_names[index],
+			strlen(shaders[vertex].attribute_names[index]) + 1);
+		hash = program_hash_add(hash, &shaders[vertex].attribute_locations[index],
+			sizeof(shaders[vertex].attribute_locations[index]));
+	}
+	return hash;
+}
+
+static void program_compile_now(GLuint shader)
+{
+	GLint compiled = 0;
+
+	if (!shader || shader >= LAYER_TRACKED || !shaders[shader].deferred)
+		return;
+	shaders[shader].deferred = 0;
+	real.CompileShader(shader);
+	halo_glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+	if (!compiled)
+	{
+		char log[512] = "";
+
+		halo_glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+		platform_log("gles2: a %s shader does not compile: %s", shaders[shader].type == GL_VERTEX_SHADER ? "vertex" :
+			"fragment", log);
+	}
+}
+
+/* a program linked: from its binary when there is one, else from its texts
+(and its binary kept). Whether it is linked */
+static GLint program_link(GLuint program, GLuint vertex, GLuint fragment)
+{
+	char path[1100];
+	GLint linked = 0;
+	int keyed = program_binaries_on() && vertex && vertex < LAYER_TRACKED && fragment && fragment < LAYER_TRACKED &&
+		shaders[vertex].source && shaders[fragment].source;
+
+	if (keyed)
+	{
+		FILE *file;
+
+		snprintf(path, sizeof(path), "%s/%016llx.bin", program_binaries.folder, program_key(vertex, fragment));
+		file = fopen(path, "rb");
+		if (file)
+		{
+			unsigned char *data = NULL;
+			unsigned int format = 0;
+			long length = 0;
+
+			if (fread(&format, sizeof(format), 1, file) == 1 && !fseek(file, 0, SEEK_END) &&
+				(length = ftell(file) - (long)sizeof(format)) > 0 && (data = malloc((size_t)length)) != NULL &&
+				!fseek(file, (long)sizeof(format), SEEK_SET) && fread(data, 1, (size_t)length, file) == (size_t)length)
+			{
+				program_binaries.load(program, (GLenum)format, data, (GLint)length);
+				halo_glGetProgramiv(program, GL_LINK_STATUS, &linked);
+			}
+			free(data);
+			fclose(file);
+			if (linked)
+			{
+				program_binaries.loaded++;
+				return linked;
+			}
+		}
+	}
+	program_compile_now(vertex);
+	program_compile_now(fragment);
+	real.LinkProgram(program);
+	halo_glGetProgramiv(program, GL_LINK_STATUS, &linked);
+	program_binaries.linked++;
+	if (keyed && linked)
+	{
+		GLint length = 0;
+
+		halo_glGetProgramiv(program, 0x8741 /* GL_PROGRAM_BINARY_LENGTH_OES */, &length);
+		if (length > 0)
+		{
+			unsigned char *data = malloc((size_t)length);
+			GLsizei written = 0;
+			GLenum format = 0;
+
+			if (data)
+			{
+				FILE *file;
+
+				program_binaries.get(program, length, &written, &format, data);
+				file = written > 0 ? fopen(path, "wb") : NULL;
+				if (file)
+				{
+					unsigned int format_word = (unsigned int)format;
+
+					fwrite(&format_word, sizeof(format_word), 1, file);
+					fwrite(data, 1, (size_t)written, file);
+					fclose(file);
+					program_binaries.saved++;
+				}
+				free(data);
+			}
+		}
+	}
+	return linked;
+}
+
+/* a deferred shader is compiled as far as the renderer asks */
+static void (GL_APIENTRY *real_GetShaderiv)(GLuint, GLenum, GLint *);
+
+static void GL_APIENTRY layer_GetShaderiv(GLuint shader, GLenum pname, GLint *params)
+{
+	if (pname == GL_COMPILE_STATUS && shader && shader < LAYER_TRACKED && shaders[shader].deferred)
+	{
+		*params = GL_TRUE;
+		return;
+	}
+	real_GetShaderiv(shader, pname, params);
+}
+
 static void GL_APIENTRY layer_LinkProgram(GLuint program)
 {
 	static int reported;
 	GLint linked = 0;
+	GLuint attached_fragment = 0;
 
 	if (program < LAYER_TRACKED && program_vertex_shaders[program])
 	{
@@ -3760,6 +4032,8 @@ static void GL_APIENTRY layer_LinkProgram(GLuint program)
 		unsigned int unwritten = ~texture_w_written(shaders[program_vertex_shaders[program]].source) & 15u;
 		GLuint copy = unwritten ? fragment_specialized(program_fragment_shaders[program], unwritten) : 0;
 
+		attached_fragment = copy ? copy : program_fragment_shaders[program];
+
 		if (!detach)
 			detach = (__typeof__(detach))SDL_GL_GetProcAddress("glDetachShader");
 		if (copy && detach)
@@ -3769,8 +4043,23 @@ static void GL_APIENTRY layer_LinkProgram(GLuint program)
 		}
 	}
 	counts.links++;
-	real.LinkProgram(program);
-	halo_glGetProgramiv(program, GL_LINK_STATUS, &linked);
+	linked = program_link(program, program < LAYER_TRACKED ? program_vertex_shaders[program] : 0,
+		attached_fragment ? attached_fragment : (program < LAYER_TRACKED ? program_fragment_shaders[program] : 0));
+	/* (its pixel shader without its divides did not do: with them) */
+	if (!linked && attached_fragment && program < LAYER_TRACKED && attached_fragment != program_fragment_shaders[program])
+	{
+		static void (GL_APIENTRY *detach_copy)(GLuint, GLuint);
+
+		if (!detach_copy)
+			detach_copy = (__typeof__(detach_copy))SDL_GL_GetProcAddress("glDetachShader");
+		if (detach_copy)
+		{
+			LAYER_ONCE("a program without its pixel shader's divides does not link: the divides are kept");
+			detach_copy(program, attached_fragment);
+			real.AttachShader(program, program_fragment_shaders[program]);
+			linked = program_link(program, program_vertex_shaders[program], program_fragment_shaders[program]);
+		}
+	}
 	/* (a name used again is another program: its c[] is looked up anew) */
 	if (program < LAYER_TRACKED)
 	{
@@ -4644,6 +4933,8 @@ int console_gles2_layer(void)
 	LAYER_REPLACE(CreateShader);
 	LAYER_REPLACE(ShaderSource);
 	LAYER_REPLACE(CompileShader);
+	real_GetShaderiv = halo_glGetShaderiv;
+	LAYER_REPLACE(GetShaderiv);
 	LAYER_REPLACE(AttachShader);
 	LAYER_REPLACE(LinkProgram);
 	LAYER_REPLACE(UseProgram);

@@ -235,6 +235,8 @@ static void screenshot(void)
 	halo_test_screenshot();
 }
 
+void steamlink_memtrace_update(void);
+
 void console_performance_update(void)
 {
 	static unsigned was_held;
@@ -245,6 +247,7 @@ void console_performance_update(void)
 	Uint64 now = SDL_GetTicks();
 
 	was_held = held;
+	steamlink_memtrace_update();
 	steamlink_performance_update((pressed & (1u << COMBO_PERFORMANCE)) != 0);
 	if (pressed & (1u << COMBO_FRAMERATE))
 	{

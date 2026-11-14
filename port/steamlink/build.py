@@ -114,7 +114,7 @@ STEAMLINK_UPDATES = ['-DHALO_PORT_UPDATE_PLATFORM=\\"steamlink\\"',
 # the port's own platform units
 STEAMLINK_SOURCES = ["src/gles2_layer.c", "src/steamlink_audio.c", "src/steamlink_perf_log.c",
                      "src/steamlink_combos.c", "src/steamlink_cache_screen.c",
-                     "src/steamlink_setup.c"]
+                     "src/steamlink_setup.c", "src/steamlink_memtrace.c"]
 # the port's units that see the game as its own sources do (no system headers)
 STEAMLINK_GAME_SOURCES = ["src/steamlink_performance.c"]
 # the sdk's gcc, for its crt files and libgcc (clang finds glibc in the root
