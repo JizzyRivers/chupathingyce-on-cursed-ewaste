@@ -1,0 +1,825 @@
+diff --git a/port/linux/src/d3d8_gl.c b/port/linux/src/d3d8_gl.c
+index adf83efd4..7aed734c3 100644
+--- a/port/linux/src/d3d8_gl.c
++++ b/port/linux/src/d3d8_gl.c
+@@ -1146,8 +1146,8 @@ static struct
+ 	GLenum active_texture;
+ 	/* per unit: the GL_TEXTURE_2D, GL_TEXTURE_CUBE_MAP and GL_TEXTURE_3D
+ 	bindings */
+-	GLuint textures[D3DTSS_MAXSTAGES][3];
+-	GLuint samplers[D3DTSS_MAXSTAGES];
++	GLuint textures[D3DTSS_MAXSTAGES * 2][3];
++	GLuint samplers[D3DTSS_MAXSTAGES * 2];
+ 	GLuint array_buffer;
+ 	GLuint element_array_buffer;
+ 	unsigned char attribute_enabled[XGPU_VERTEX_ATTRIBUTE_COUNT];
+@@ -3975,11 +3975,17 @@ static DWORD forced_anisotropy(void)
+ filtered and from its mip levels whatever the game asks: the HUD's meters are
+ point sampled for one player, to keep the Xbox bitmaps' texels sharp; flat: a
+ 2D texture (not a cube or 3D one), the only kind given forced anisotropy */
++/* the unit stage 0's texture goes on: 0, or 4 for the second pass of a fused
++draw (fuse_draw) */
++static int texture_unit_base;
++
+ static void configure_sampler(int stage, BOOL mipmapped, BOOL hires, BOOL flat)
+ {
+-	/* the texture stage state each stage's sampler was last chosen by */
+-	static DWORD configured[D3DTSS_MAXSTAGES][SAMPLER_STATE_WORDS];
+-	static GLuint configured_sampler[D3DTSS_MAXSTAGES];
++	/* the texture stage state each unit's sampler was last chosen by */
++	static DWORD configured_units[D3DTSS_MAXSTAGES * 2][SAMPLER_STATE_WORDS];
++	static GLuint configured_sampler_units[D3DTSS_MAXSTAGES * 2];
++	DWORD (*configured)[SAMPLER_STATE_WORDS] = &configured_units[texture_unit_base];
++	GLuint *configured_sampler = &configured_sampler_units[texture_unit_base];
+ 	DWORD *state = D3D__TextureState[stage];
+ 	DWORD inputs[SAMPLER_STATE_WORDS];
+ 
+@@ -4010,7 +4016,7 @@ static void configure_sampler(int stage, BOOL mipmapped, BOOL hires, BOOL flat)
+ 		memcpy(configured[stage], inputs, sizeof(inputs));
+ 		configured_sampler[stage] = sampler_get(stage, inputs);
+ 	}
+-	state_sampler(stage, configured_sampler[stage]);
++	state_sampler(stage + texture_unit_base, configured_sampler[stage]);
+ }
+ 
+ 
+@@ -4342,7 +4348,7 @@ static void bind_textures(struct nv2a_pixel_shader_key *key, float texture_scale
+ 	if (XGPU_GL_LEGACY)
+ 	{
+ 		for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
+-			state_texture(stage, gl_targets[stage], gl_textures[stage]);
++			state_texture(stage + texture_unit_base, gl_targets[stage], gl_textures[stage]);
+ 	}
+ #endif
+ #if XGPU_GL_BINDINGS
+@@ -4668,6 +4674,515 @@ static unsigned long model_light_register(int light)
+ 	return (unsigned long)(XGPU_VERTEX_CONSTANT_BIAS + (light ? -80 + light : -82));
+ }
+ 
++/* ---------- two passes of the level's geometry as one draw (fused)
++
++The level's geometry is drawn once for its lightmaps (A: opaque, depth
++written) and once more for its textures (B: the same triangles, multiplied
++into A's pixels). On a console whose driver's cost is the draw itself that
++is half of the level's draws for nothing. Between d3d8_gl_fuse_capture(1)
++and (0) the game makes A's draw, which is kept and not drawn; then B's,
++which is drawn with A's state and a program made of both: A's vertex shader
++with B's four coordinates, A's pixel shader multiplied by B's, B's textures
++on units 4 to 7. Where the two cannot be one program (B's shaders are not
++the ones known here, or the program does not link), A is drawn, then B with
++the texture pass's blend and depth test: as it was. */
++#ifdef HALO_CONSOLE_GLES2
++#define FUSE_CAPTURES 8
++#define FUSE_PROGRAMS 192
++#define FUSE_CONSTANT_FIRST 12
++#define FUSE_CONSTANT_COUNT 7
++
++struct fuse_state
++{
++	DWORD render_state[D3DRS_MAX];
++	DWORD texture_state[D3DTSS_MAXSTAGES][D3DTSS_MAX];
++	D3DBaseTexture *textures[D3DTSS_MAXSTAGES];
++	D3DPalette *palettes[D3DTSS_MAXSTAGES];
++	struct vertex_shader_object *vertex_shader;
++	struct vertex_shader_object *program_slots[VERTEX_PROGRAM_SLOTS];
++	unsigned long program_address;
++	float constants[FUSE_CONSTANT_COUNT][4];
++	unsigned char streams[sizeof(((struct gl_device *)0)->streams)];
++	UINT base_vertex_index;
++	WORD *index_data;
++	int mcc;
++	D3DPRIMITIVETYPE type;
++	UINT count;
++	CONST WORD *indices;
++};
++
++struct fuse_program
++{
++	struct vertex_shader_object *program, *declaration;
++	unsigned long hash_a, hash_b;
++	struct nv2a_pixel_shader_key key_a, key_b;
++	int alpha;
++	/* (NULL: the two are not one program) */
++	struct program_entry *entry;
++	GLint constants, scale;
++	float constants_shadow[3][4], scale_shadow[4][4];
++};
++
++static struct
++{
++	int capturing, texturing, inside, active, failed, alpha;
++	int count, next;
++	struct fuse_state captures[FUSE_CAPTURES];
++	struct fuse_state *current;
++	struct nv2a_pixel_shader_key key_b;
++	float scale_b[4][4];
++	float constants_b[3][4];
++	struct fuse_program *programs[FUSE_PROGRAMS];
++	int program_count;
++	struct fuse_program *program;
++	unsigned long fused, apart, frame;
++} fuse;
++
++static void draw_indexed_vertices_untimed(D3DPRIMITIVETYPE primitive_type, UINT vertex_count, CONST WORD *index_data);
++
++static void fuse_state_keep(struct fuse_state *state, D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices)
++{
++	memcpy(state->render_state, D3D__RenderState, sizeof(state->render_state));
++	memcpy(state->texture_state, D3D__TextureState, sizeof(state->texture_state));
++	memcpy(state->textures, device.textures, sizeof(state->textures));
++	memcpy(state->palettes, device.palettes, sizeof(state->palettes));
++	state->vertex_shader = device.vertex_shader;
++	memcpy(state->program_slots, device.program_slots, sizeof(state->program_slots));
++	state->program_address = device.program_address;
++	memcpy(state->constants, device.constants[FUSE_CONSTANT_FIRST], sizeof(state->constants));
++	memcpy(state->streams, device.streams, sizeof(state->streams));
++	state->base_vertex_index = device.base_vertex_index;
++	state->index_data = D3D__IndexData;
++	state->mcc = mcc_environment_shader_active();
++	state->type = type;
++	state->count = count;
++	state->indices = indices;
++}
++
++static void fuse_state_apply(const struct fuse_state *state)
++{
++	memcpy(D3D__RenderState, state->render_state, sizeof(state->render_state));
++	memcpy(D3D__TextureState, state->texture_state, sizeof(state->texture_state));
++	memcpy(device.textures, state->textures, sizeof(state->textures));
++	memcpy(device.palettes, state->palettes, sizeof(state->palettes));
++	device.vertex_shader = state->vertex_shader;
++	memcpy(device.program_slots, state->program_slots, sizeof(state->program_slots));
++	device.program_address = state->program_address;
++	constants_store(FUSE_CONSTANT_FIRST, state->constants, FUSE_CONSTANT_COUNT);
++	memcpy(device.streams, state->streams, sizeof(state->streams));
++	device.base_vertex_index = state->base_vertex_index;
++	D3D__IndexData = state->index_data;
++}
++
++/* text with every from replaced by to (the caller's to free; text is freed) */
++static char *fuse_replace(char *text, const char *from, const char *to)
++{
++	size_t from_length = strlen(from), to_length = strlen(to), count = 0, length;
++	const char *found;
++	char *result, *out;
++
++	if (!text)
++		return NULL;
++	for (found = strstr(text, from); found; found = strstr(found + from_length, from))
++		count++;
++	length = strlen(text) + count * to_length - count * from_length;
++	result = out = malloc(length + 1);
++	if (result)
++	{
++		const char *in = text;
++
++		while ((found = strstr(in, from)) != NULL)
++		{
++			memcpy(out, in, (size_t)(found - in));
++			out += found - in;
++			memcpy(out, to, to_length);
++			out += to_length;
++			in = found + from_length;
++		}
++		strcpy(out, in);
++	}
++	free(text);
++	return result;
++}
++
++/* text with more put in before its first (or last) appearance of at; NULL
++(and text freed) where it has none */
++static char *fuse_insert(char *text, const char *at, const char *more, BOOL last)
++{
++	char *place = NULL, *result;
++
++	if (text)
++	{
++		char *found;
++
++		for (found = strstr(text, at); found; found = last ? strstr(found + 1, at) : NULL)
++			place = found;
++	}
++	if (!place)
++	{
++		free(text);
++		return NULL;
++	}
++	result = malloc(strlen(text) + strlen(more) + 1);
++	if (result)
++	{
++		memcpy(result, text, (size_t)(place - text));
++		strcpy(result + (place - text), more);
++		strcat(result, place);
++	}
++	free(text);
++	return result;
++}
++
++/* whether B's vertex program is the texture pass's: the position, and four
++coordinates made of v4 and c[12..14], as fuse_vertex_source writes them */
++static BOOL fuse_vertex_b_known(struct vertex_shader_object *program)
++{
++	static struct vertex_shader_object *checked[4];
++	static BOOL known[4];
++	static int next;
++	int index;
++	char *source;
++	const char *found;
++	BOOL result = TRUE;
++
++	for (index = 0; index < 4; index++)
++	{
++		if (checked[index] == program)
++			return known[index];
++	}
++	source = nv2a_vertex_shader_to_glsl(program->instructions, program->instruction_count, 0, NULL, FALSE);
++	if (!source)
++		return FALSE;
++	for (found = strstr(source, "c["); found && result; found = strstr(found + 1, "c["))
++	{
++		long number = atol(found + 2);
++
++		if (found > source && (found[-1] == '_' || (found[-1] >= 'a' && found[-1] <= 'z')))
++			continue;
++		result = number <= 3 || (number >= 12 && number <= 14) || number == 58 || number == 59 || number == 192;
++	}
++	result = result && strstr(source, "B = c[13].xyzw;\n\tC = v4.xyzw;") && strstr(source, "B = c[14].xyzw;\n\tC = v4.xyzw;") &&
++		strstr(source, "B = c[12].xyyy;") && strstr(source, "B = c[12].zwww;") && strstr(source, "B = c[13].zzzz;") &&
++		strstr(source, "B = c[14].zzzz;") && strstr(source, "oT3.y = mac.y;") && !strstr(source, "oD0.") &&
++		!strstr(source, "oT0.z") && !strstr(source, "oT0.w") && !strstr(source, "oFog.");
++	free(source);
++	checked[next] = program;
++	known[next] = result;
++	next = (next + 1) % 4;
++	return result;
++}
++
++/* A's vertex shader with B's coordinates */
++static char *fuse_vertex_source(char *source)
++{
++	if (!source || !strstr(source, " in vec4 v4_in;"))
++	{
++		free(source);
++		return NULL;
++	}
++	source = fuse_insert(source, "uniform vec4 viewport_scale;",
++		"uniform vec4 fuse_c[3];\nout vec4 xU0;\nout vec4 xU1;\n", FALSE);
++	return fuse_insert(source, "}",
++		"\t{\n"
++		"\t\tvec2 fuse_b = vec2(dot(v4_in.xyz, fuse_c[1].xyz) + fuse_c[1].w, dot(v4_in.xyz, fuse_c[2].xyz) + fuse_c[2].w);\n"
++		"\t\txU0 = vec4(fuse_b, fuse_b * fuse_c[0].xy);\n"
++		"\t\txU1 = vec4(fuse_b * fuse_c[0].zw, fuse_b.x * fuse_c[1].z, fuse_b.y * fuse_c[2].z);\n"
++		"\t}\n", TRUE);
++}
++
++/* A's pixel shader, its color multiplied by B's (b is freed) */
++static char *fuse_fragment_source(char *a, char *b, BOOL alpha)
++{
++	static const char *const refused[] = { "discard", "bump_", "ps_c0", "ps_c1", "ps_final", "alpha_reference",
++		"texelFetch", "textureSize", "gl_FragCoord", NULL };
++	static const char *const coordinates[4] = { "xU0.xy", "xU0.zw", "xU1.xy", "xU1.zw" };
++	char *start = b ? strstr(b, "void main()\n{\n") : NULL;
++	char *end = start ? strstr(start, "\tresult = nv2a_finite(result);") : NULL;
++	char declarations[512] = "in vec4 xU0;\nin vec4 xU1;\nuniform vec4 fuse_scale[4];\n";
++	char *body, *function;
++	int index;
++
++	if (!a || !end)
++	{
++		free(a);
++		free(b);
++		return NULL;
++	}
++	*end = 0;
++	body = strdup(start + strlen("void main()\n{\n"));
++	for (index = 0; refused[index] && body; index++)
++	{
++		if (strstr(body, refused[index]))
++		{
++			free(body);
++			body = NULL;
++		}
++	}
++	for (index = 0; index < 4 && body; index++)
++	{
++		static const char *const kinds[] = { "sampler2D", "samplerCube", "sampler3D" };
++		char from[128], to[128];
++		int kind;
++
++		for (kind = 0; kind < 3; kind++)
++		{
++			snprintf(from, sizeof(from), "uniform %s tex%d;", kinds[kind], index);
++			if (strstr(b, from))
++			{
++				snprintf(to, sizeof(to), "uniform %s tex%d;\n", kinds[kind], index + 4);
++				strcat(declarations, to);
++			}
++		}
++		snprintf(from, sizeof(from), "(vec4(xT%d.xyz / (xT%d.w != 0.0 ? xT%d.w : 1.0), 1.0))", index, index, index);
++		snprintf(to, sizeof(to), "(vec4(%s, 0.0, 1.0))", coordinates[index]);
++		body = fuse_replace(body, from, to);
++		snprintf(from, sizeof(from), "xT%d", index);
++		snprintf(to, sizeof(to), "vec4(%s, 0.0, 1.0)", coordinates[index]);
++		body = fuse_replace(body, from, to);
++		snprintf(from, sizeof(from), "texture_lod_bias[%d]", index);
++		body = fuse_replace(body, from, "0.0");
++	}
++	for (index = 3; index >= 0 && body; index--)
++	{
++		char from[16], to[16];
++
++		snprintf(from, sizeof(from), "tex%d", index);
++		snprintf(to, sizeof(to), "tex%d", index + 4);
++		body = fuse_replace(body, from, to);
++	}
++	body = fuse_replace(body, "texture_scale", "fuse_scale");
++	body = fuse_replace(body, "xD0", "vec4(0.0, 0.0, 0.0, 1.0)");
++	body = fuse_replace(body, "xD1", "vec4(0.0, 0.0, 0.0, 1.0)");
++	body = fuse_replace(body, "xFog", "1.0");
++	free(b);
++	if (!body || strstr(body, "texture_lod_bias"))
++	{
++		free(body);
++		free(a);
++		return NULL;
++	}
++	function = malloc(strlen(body) + 128);
++	if (function)
++		sprintf(function, "vec4 fuse_b()\n{\n%s\treturn clamp(nv2a_finite(result), 0.0, 1.0);\n}\n", body);
++	free(body);
++	if (!function || !strstr(a, "\tfragment_color = clamp(result, 0.0, 1.0);") ||
++		strstr(strstr(a, "\tfragment_color = clamp(result, 0.0, 1.0);") + 1, "\tfragment_color = "))
++	{
++		free(function);
++		free(a);
++		return NULL;
++	}
++	a = fuse_insert(a, "vec4 nv2a_finite(", declarations, FALSE);
++	a = fuse_insert(a, "void main()\n", function, FALSE);
++	free(function);
++	return fuse_replace(a, "\tfragment_color = clamp(result, 0.0, 1.0);", alpha ?
++		"\tfragment_color = clamp(result, 0.0, 1.0) * fuse_b();" :
++		"\tfragment_color = clamp(result, 0.0, 1.0) * vec4(fuse_b().rgb, 1.0);");
++}
++
++/* the program of A's vertex program and pixel key with B's (fuse.key_b),
++NULL where they are not one */
++static struct program_entry *fuse_program_get(struct vertex_shader_object *program,
++	const struct nv2a_pixel_shader_key *key_a)
++{
++	unsigned long hash_a = hash_words(key_a, sizeof(*key_a)), hash_b = hash_words(&fuse.key_b, sizeof(fuse.key_b));
++	struct fuse_program *found;
++	char *vertex_source, *fragment_source;
++	int index;
++
++	for (index = 0; index < fuse.program_count; index++)
++	{
++		found = fuse.programs[index];
++		if (found->hash_a == hash_a && found->hash_b == hash_b && found->program == program &&
++			found->declaration == device.vertex_shader && found->alpha == fuse.alpha &&
++			words_equal(&found->key_a, key_a, sizeof(*key_a)) && words_equal(&found->key_b, &fuse.key_b, sizeof(fuse.key_b)))
++		{
++			fuse.program = found;
++			return found->entry;
++		}
++	}
++	if (fuse.program_count == FUSE_PROGRAMS || !(found = calloc(1, sizeof(*found))))
++		return NULL;
++	fuse.programs[fuse.program_count++] = found;
++	found->program = program;
++	found->declaration = device.vertex_shader;
++	found->hash_a = hash_a;
++	found->hash_b = hash_b;
++	found->key_a = *key_a;
++	found->key_b = fuse.key_b;
++	found->alpha = fuse.alpha;
++	memset(found->constants_shadow, 0xff, sizeof(found->constants_shadow));
++	memset(found->scale_shadow, 0xff, sizeof(found->scale_shadow));
++	fuse.program = found;
++	vertex_source = fuse_vertex_source(nv2a_vertex_shader_to_glsl(program->instructions, program->instruction_count,
++		device.vertex_shader->packed_mask, NULL, FALSE));
++	fragment_source = fuse_fragment_source(nv2a_pixel_shader_to_glsl(key_a), nv2a_pixel_shader_to_glsl(&fuse.key_b),
++		fuse.alpha);
++	if (vertex_source && fragment_source)
++	{
++		GLuint vertex = xgpu_shader_cache_compile(GL_VERTEX_SHADER, vertex_source, "vertex");
++		GLuint fragment = xgpu_shader_cache_compile(GL_FRAGMENT_SHADER, fragment_source, "pixel");
++
++		if (debug_settings.dump_shaders)
++		{
++			char path[512];
++			FILE *file;
++
++			snprintf(path, sizeof(path), "%s/fused_%08lx_%08lx.glsl", debug_settings.dump_shaders, hash_a, hash_b);
++			if ((file = fopen(path, "w")) != NULL)
++			{
++				fputs(vertex_source, file);
++				fputs("\n/* ---- */\n", file);
++				fputs(fragment_source, file);
++				fclose(file);
++			}
++		}
++		if (vertex && fragment)
++			found->entry = program_get(vertex, fragment);
++	}
++	free(vertex_source);
++	free(fragment_source);
++	if (found->entry)
++	{
++		state_program(found->entry->program);
++		found->constants = glGetUniformLocation(found->entry->program, "fuse_c");
++		found->scale = glGetUniformLocation(found->entry->program, "fuse_scale");
++		for (index = 0; index < D3DTSS_MAXSTAGES; index++)
++		{
++			char name[8];
++			GLint location;
++
++			snprintf(name, sizeof(name), "tex%d", index + D3DTSS_MAXSTAGES);
++			location = glGetUniformLocation(found->entry->program, name);
++			if (location >= 0)
++				glUniform1i(location, index + D3DTSS_MAXSTAGES);
++		}
++	}
++	else
++		platform_log("GPU: a lightmap and a texture pass (vertex shader %lu, pixel shaders %08lx and %08lx) are not "
++			"one program here: drawn one after the other", program->id, hash_a, hash_b);
++	return found->entry;
++}
++
++/* B's pixel key, its textures bound on units 4 to 7 */
++static void fuse_key_b(void)
++{
++	struct nv2a_pixel_shader_key *key = &fuse.key_b;
++	int stage;
++
++	memset(key, 0, sizeof(*key));
++	memcpy(key->combiner_state, D3D__RenderState, sizeof(key->combiner_state));
++	memset(&key->combiner_state[D3DRS_PSCONSTANT0_0], 0, 16 * sizeof(DWORD));
++	key->combiner_state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0;
++	key->combiner_state[D3DRS_PSFINALCOMBINERCONSTANT1] = 0;
++	key->texture_modes = D3D__RenderState[D3DRS_PSTEXTUREMODES];
++	texture_unit_base = D3DTSS_MAXSTAGES;
++	bind_textures(key, fuse.scale_b);
++	texture_unit_base = 0;
++	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
++	{
++		key->alpha_kill[stage] = D3D__TextureState[stage][D3DTSS_ALPHAKILL] == D3DTALPHAKILL_ENABLE;
++		key->color_sign[stage] = (unsigned char)((D3D__TextureState[stage][D3DTSS_COLORSIGN] >> 28) & 0xf);
++	}
++	key->coverage_alpha = 0;
++	key->point_threshold = 0;
++	key->fog_enable = D3D__RenderState[D3DRS_FOGENABLE] != 0;
++	key->fog_table_mode = (unsigned char)D3D__RenderState[D3DRS_FOGTABLEMODE];
++}
++
++/* (prepare_draw's, with the fused program current) */
++static void fuse_uniforms(void)
++{
++	uniform_vec4(fuse.program->constants, fuse.program->constants_shadow[0], fuse.constants_b[0], 3);
++	uniform_vec4(fuse.program->scale, fuse.program->scale_shadow[0], fuse.scale_b[0], 4);
++}
++
++/* B's draw: with the A kept for it as one draw, or the two as they were */
++static void fuse_draw(D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices)
++{
++	static struct fuse_state b;
++	static const DWORD forced[][2] = {
++		{ D3DRS_ALPHABLENDENABLE, TRUE }, { D3DRS_SRCBLEND, D3DBLEND_DESTCOLOR }, { D3DRS_DESTBLEND, D3DBLEND_ZERO },
++		{ D3DRS_BLENDOP, D3DBLENDOP_ADD }, { D3DRS_ALPHATESTENABLE, FALSE }, { D3DRS_ZFUNC, D3DCMP_EQUAL },
++		{ D3DRS_ZWRITEENABLE, FALSE },
++	};
++	struct fuse_state *a = fuse.next < fuse.count ? &fuse.captures[fuse.next] : NULL;
++	DWORD kept[sizeof(forced) / sizeof(forced[0])], kept_write;
++	unsigned long index;
++
++	fuse.next++;
++	fuse.inside = TRUE;
++	if (a)
++	{
++		BOOL fusable = a->count == count && a->indices == indices && a->type == type &&
++			fuse_vertex_b_known(current_program());
++
++		fuse_state_keep(&b, type, count, indices);
++		if (fusable)
++		{
++			fuse_key_b();
++			memcpy(fuse.constants_b, device.constants[FUSE_CONSTANT_FIRST], sizeof(fuse.constants_b));
++			fuse_state_apply(a);
++			fuse.current = a;
++			fuse.failed = FALSE;
++			fuse.active = TRUE;
++			draw_indexed_vertices_untimed(a->type, a->count, a->indices);
++			fuse.active = FALSE;
++			if (!fuse.failed)
++			{
++				fuse_state_apply(&b);
++				fuse.fused++;
++				fuse.inside = FALSE;
++				return;
++			}
++		}
++		else
++			fuse_state_apply(a);
++		/* A by itself (its state is the device's) */
++		fuse.current = a;
++		fuse.failed = TRUE;
++		draw_indexed_vertices_untimed(a->type, a->count, a->indices);
++		fuse.failed = FALSE;
++		fuse_state_apply(&b);
++	}
++	/* B by itself, as the texture pass draws it */
++	for (index = 0; index < sizeof(forced) / sizeof(forced[0]); index++)
++	{
++		kept[index] = D3D__RenderState[forced[index][0]];
++		D3D__RenderState[forced[index][0]] = forced[index][1];
++	}
++	kept_write = D3D__RenderState[D3DRS_COLORWRITEENABLE];
++	if (!fuse.alpha)
++		D3D__RenderState[D3DRS_COLORWRITEENABLE] = D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN |
++			D3DCOLORWRITEENABLE_BLUE;
++	draw_indexed_vertices_untimed(type, count, indices);
++	for (index = 0; index < sizeof(forced) / sizeof(forced[0]); index++)
++		D3D__RenderState[forced[index][0]] = kept[index];
++	D3D__RenderState[D3DRS_COLORWRITEENABLE] = kept_write;
++	fuse.apart++;
++	fuse.inside = FALSE;
++}
++
++/* 1: the draws that follow are a lightmap pass's, kept. 0: the ones that
++follow are the texture pass's of the same triangles (alpha: written by it
++too). d3d8_gl_fuse_end: neither */
++void d3d8_gl_fuse_capture(int capture, int alpha)
++{
++	fuse.capturing = capture;
++	fuse.texturing = !capture;
++	fuse.alpha = alpha;
++	if (capture)
++		fuse.count = fuse.next = 0;
++}
++
++void d3d8_gl_fuse_end(void)
++{
++	fuse.capturing = fuse.texturing = FALSE;
++	fuse.count = fuse.next = 0;
++}
++#endif
++
+ static struct program_entry *prepare_draw(BOOL immediate)
+ {
+ 	struct vertex_shader_object *program = current_program();
+@@ -4708,6 +5223,10 @@ static struct program_entry *prepare_draw(BOOL immediate)
+ 	key.combiner_state[D3DRS_PSFINALCOMBINERCONSTANT1] = 0;
+ 	key.texture_modes = D3D__RenderState[D3DRS_PSTEXTUREMODES];
+ 	key.mcc_bump_attenuation = mcc_environment_shader_active();
++#ifdef HALO_CONSOLE_GLES2
++	if (fuse.inside && fuse.current)
++		key.mcc_bump_attenuation = fuse.current->mcc;
++#endif
+ 	/* the textures before the targets: a render target the draw samples
+ 	has its multisampled pixels resolved by a blit (render_target_resolve),
+ 	which binds framebuffers of its own, and the back buffer can be both
+@@ -4778,6 +5297,17 @@ static struct program_entry *prepare_draw(BOOL immediate)
+ 			key.per_pixel_lighting = 0;
+ 		}
+ 	}
++#ifdef HALO_CONSOLE_GLES2
++	if (fuse.active)
++	{
++		entry = fuse_program_get(program, &key);
++		if (!entry)
++		{
++			fuse.failed = TRUE;
++			return NULL;
++		}
++	}
++#endif
+ 	if (!entry)
+ 		entry = program_get(vertex_shader_get(program, immediate, FALSE, FALSE), fragment_shader_get(&key));
+ 	if (!entry)
+@@ -4787,7 +5317,11 @@ static struct program_entry *prepare_draw(BOOL immediate)
+ 		return NULL;
+ 	}
+ #ifdef HALO_SHADER_PREP
+-	if (entry->noted != shader_prep_serial)
++	if (entry->noted != shader_prep_serial
++#ifdef HALO_CONSOLE_GLES2
++		&& !fuse.active
++#endif
++		)
+ 	{
+ 		BOOL lit = key.per_pixel_lighting != 0;
+ 
+@@ -4803,6 +5337,10 @@ static struct program_entry *prepare_draw(BOOL immediate)
+ 		stats.draws++;
+ 	draw_flush();
+ 	state_program(entry->program);
++#ifdef HALO_CONSOLE_GLES2
++	if (fuse.active)
++		fuse_uniforms();
++#endif
+ 	if (plasma_mask && entry->plasma_model_slots >= 0)
+ 	{
+ 		plasma_occlusion_bind_model(&entry->plasma_occlusion);
+@@ -5840,6 +6378,21 @@ static void draw_indexed_vertices_untimed(D3DPRIMITIVETYPE primitive_type, UINT
+ 		cr_draw_indexed(primitive_type, vertex_count, index_data);
+ 		return;
+ 	}
++#endif
++#ifdef HALO_CONSOLE_GLES2
++	if (!fuse.inside && vertex_count && index_data)
++	{
++		if (fuse.capturing && fuse.count < FUSE_CAPTURES && primitive_type != D3DPT_QUADLIST)
++		{
++			fuse_state_keep(&fuse.captures[fuse.count++], primitive_type, vertex_count, index_data);
++			return;
++		}
++		if (fuse.texturing)
++		{
++			fuse_draw(primitive_type, vertex_count, index_data);
++			return;
++		}
++	}
+ #endif
+ 	if (!vertex_count || !index_data || !prepare_draw(FALSE))
+ 		return;
+diff --git a/source/rasterizer/xbox/rasterizer_xbox_environment.c b/source/rasterizer/xbox/rasterizer_xbox_environment.c
+index e52118cf3..7f1c3949c 100644
+--- a/source/rasterizer/xbox/rasterizer_xbox_environment.c
++++ b/source/rasterizer/xbox/rasterizer_xbox_environment.c
+@@ -1151,6 +1151,73 @@ void _rasterizer_environment_lightmap_begin(
+ 	return;
+ }
+ 
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++/* port: the lightmap pass and the texture pass of a part of the level as
++one draw (d3d8_gl.c, "fused"): the lightmap pass's draw is kept by the D3D
++layer, and the texture pass's draw of the same triangles is drawn with
++both. The render state is the lightmap pass's throughout: the texture
++pass's draw sets none. Its textures take the stages the lightmap and the
++normalization cube were on, so those are set again for each part. */
++void d3d8_gl_fuse_capture(int capture, int alpha);
++void d3d8_gl_fuse_end(void);
++void _rasterizer_environment_diffuse_texture_draw(
++	struct shader const *shader,
++	short bitmap_index,
++	long dynamic_triangle_buffer_index,
++	long first_triangle_index,
++	long triangle_count,
++	struct vertex_buffer const *vertex_buffer);
++
++static struct bitmap_data const *fused_lightmap_bitmap;
++
++void _rasterizer_environment_fused_lightmap_begin(
++	struct bitmap_data const *lightmap_bitmap)
++{
++	fused_lightmap_bitmap = lightmap_bitmap;
++	_rasterizer_environment_lightmap_begin(lightmap_bitmap);
++	return;
++}
++
++void _rasterizer_environment_fused_draw(
++	struct shader const *shader,
++	short bitmap_index,
++	long dynamic_triangle_buffer_index,
++	long first_triangle_index,
++	long triangle_count,
++	struct vertex_buffer const *vertex_buffer)
++{
++	int alpha = rasterizer_debug_options.environment_specular_mask_enabled != FALSE;
++
++	rasterizer_set_texture_direct(3, global_rasterizer_data->vector_normalization.index, 0);
++	D3DDevice_SetTextureState_Deferred(3, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
++	D3DDevice_SetTextureState_Deferred(3, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
++	D3DDevice_SetTextureState_Deferred(3, D3DTSS_ADDRESSW, D3DTADDRESS_CLAMP);
++	D3DDevice_SetTextureState_Deferred(3, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
++	D3DDevice_SetTextureState_Deferred(3, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
++	D3DDevice_SetTextureState_Deferred(3, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
++	_rasterizer_environment_lightmap_begin(fused_lightmap_bitmap);
++
++	d3d8_gl_fuse_capture(TRUE, alpha);
++	_rasterizer_environment_lightmap_draw(
++		shader,
++		bitmap_index,
++		dynamic_triangle_buffer_index,
++		first_triangle_index,
++		triangle_count,
++		vertex_buffer);
++	d3d8_gl_fuse_capture(FALSE, alpha);
++	_rasterizer_environment_diffuse_texture_draw(
++		shader,
++		bitmap_index,
++		dynamic_triangle_buffer_index,
++		first_triangle_index,
++		triangle_count,
++		vertex_buffer);
++	d3d8_gl_fuse_end();
++	return;
++}
++#endif
++
+ void _rasterizer_environment_diffuse_light_end(
+ 	void)
+ {
+diff --git a/source/render/render.c b/source/render/render.c
+index 4e3ccd7d4..f9e6bccde 100644
+--- a/source/render/render.c
++++ b/source/render/render.c
+@@ -99,6 +99,12 @@ symbols in this file:
+ /* port: static transparent part links for the newly loaded model tags. */
+ #include "models/models.h"
+ 
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++boolean console_performance_fused_level_passes(void);
++void structure_render_lightmaps_and_textures(void);
++static boolean level_passes_fused;
++#endif
++
+ /* ---------- constants */
+ 
+ enum
+@@ -461,6 +467,14 @@ static void render_window(
+ #endif
+ 		HALO_PERF_RENDER_PART(_halo_perf_render_world);
+ 		structure_render_preprocess();
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++		/* port: the level's lightmaps and textures in one pass, where
++		nothing is drawn between the two (structure_render.c) */
++		level_passes_fused = console_performance_fused_level_passes();
++		if (level_passes_fused)
++			structure_render_lightmaps_and_textures();
++		else
++#endif
+ 		structure_render_lightmaps();
+ 		HALO_PERF_RENDER_PART(_halo_perf_render_lens_flares);
+ 		rasterizer_lens_flares_submit_occlusion_tests();
+@@ -487,6 +501,9 @@ static void render_window(
+ 		}
+ 		rasterizer_decals_end();
+ 
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++		if (!level_passes_fused)
++#endif
+ 		structure_render_diffuse_texture();
+ 
+ 		rasterizer_decals_begin(_decal_layer_primary);
+diff --git a/source/structures/structure_render.c b/source/structures/structure_render.c
+index 0db163b8a..b5a9ea145 100644
+--- a/source/structures/structure_render.c
++++ b/source/structures/structure_render.c
+@@ -662,6 +662,55 @@ void structure_render_lightmaps(
+ 	return;
+ }
+ 
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++/* port: the lightmaps and the textures in one pass (rasterizer_xbox_environment.c,
++_rasterizer_environment_fused_draw), in the lightmap pass's place */
++void _rasterizer_environment_fused_lightmap_begin(
++	struct bitmap_data const *lightmap_bitmap);
++void _rasterizer_environment_fused_draw(
++	struct shader const *shader,
++	short bitmap_index,
++	long dynamic_triangle_buffer_index,
++	long first_triangle_index,
++	long triangle_count,
++	struct vertex_buffer const *vertex_buffer);
++
++void structure_render_lightmaps_and_textures(
++	void)
++{
++	profile_enter(render_structure_lightmaps_section);
++
++	if (structure_render_globals.environment_geometry_valid)
++	{
++		short saved_lightmap_mode = rasterizer_globals.lightmap_mode;
++
++		if (global_structure_bsp_get()->lightmap_group.index == NONE
++			&& !rasterizer_globals.lightmap_mode)
++		{
++			rasterizer_globals.lightmap_mode = _rasterizer_lightmap_mode_no_lightmap;
++		}
++
++		rasterizer_environment_lightmaps_begin();
++
++		structure_render_pass(
++			render.environment_surface_indices,
++			render.environment_surface_count,
++			structure_render_globals.environment_triangles_index,
++			_rasterizer_environment_fused_lightmap_begin,
++			_rasterizer_environment_fused_draw,
++			rasterizer_environment_lightmap_end,
++			NULL);
++
++		rasterizer_environment_lightmaps_end();
++		rasterizer_globals.lightmap_mode = saved_lightmap_mode;
++	}
++
++	profile_exit(render_structure_lightmaps_section);
++
++	return;
++}
++#endif
++
+ void structure_render_diffuse_texture(
+ 	void)
+ {

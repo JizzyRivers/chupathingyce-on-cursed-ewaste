@@ -161,6 +161,23 @@ real console_performance_view_distance(void)
 	return distance > 0.0f && performance_level_fits(distance) ? 0.0f : distance;
 }
 
+/* whether the level's lightmap pass and its texture pass are drawn as one
+(render.c, d3d8_gl.c's fused draws): half of the level's draws. Only where
+nothing is drawn between the two that the textures should cover: the
+decals and the diffuse lights, which performance mode leaves out.
+HALO_GLES2_NO_FUSE draws them one after the other, as before. */
+boolean console_performance_fused_level_passes(void)
+{
+	static int allowed = -1;
+
+	if (allowed < 0)
+		allowed = !getenv("HALO_GLES2_NO_FUSE");
+	return allowed && performance_cutting() && !rasterizer_debug_options.draw_environment_decals &&
+		!rasterizer_debug_options.draw_environment_diffuse_lights &&
+		rasterizer_debug_options.draw_environment_lightmaps && rasterizer_debug_options.draw_environment_textures &&
+		rasterizer_debug_options.drawing_mode == 0;
+}
+
 /* what a model's size on the screen is multiplied by when its detail is
 chosen, 1 for the game's own */
 real console_performance_model_detail(void)

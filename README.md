@@ -81,14 +81,14 @@ clang (any clang w arm, llvm's on windows works too) + valve's sdk (https://gith
 - clone the sdk next to this as steamlink-sdk (or set MARVELL_SDK_PATH)
 - sdl3 3.4.16 w port/steamlink/toolchain.cmake, the options .github/workflows/probe.yml uses, installed to build/sdl3
 - git submodule update --init (its on chupathingyce v0.9.1a)
-- cd chupathingyce n git apply ../patches/chupathingyce/*.patch (2 small bug fixes n 1 speed fix, see below)
+- cd chupathingyce n git apply ../patches/chupathingyce/*.patch (2 small bug fixes n 2 speed things, see below)
 - cd chupathingyce && python3 configure.py --release --console-port ../port/steamlink && ninja steamlink
 - out comes chupathingyce/build/steamlink/halo. python port/steamlink/package.py makes build/chupathingyce.tgz to install from a stick
 - a release needs its version from the submodule n the signing key: python port/steamlink/release.py <key.pem> [fix number]. the key stays off every repo, nobody touches the key
 
 theres no port patch anymore. the game's arm bits, the gles path, the sound, performance mode, the cache screen n the start up screens' hooks all went upstream in chupathingyce 0.9.0 (HALO_CONSOLE_GLES2, HALO_CONSOLE_PERFORMANCE_MODE, HALO_CONSOLE_SETUP_SCREENS n the rest, halo_console_features.h lists em). this repo just fills the hooks in: port/steamlink/src. told u it was going upstream, capisce
 
-whats in patches/chupathingyce rn is 3 things: 2 lil bug fixes in the game itself that the box tripped over (a stale sort record in the transparent models, n an ai record the arm cpu reads from an odd address, that one killed b30 w a bus error), n 1 speed fix (the game drew its fog pass over the whole level even when the level has no fog u can see, thats 15 to 24 draws a frame for nothing on carousel, rat race n putput). theyll go upstream n then this folder is empty again
+whats in patches/chupathingyce rn is 4 things: 2 lil bug fixes in the game itself that the box tripped over (a stale sort record in the transparent models, n an ai record the arm cpu reads from an odd address, that one killed b30 w a bus error), n 1 speed fix (the game drew its fog pass over the whole level even when the level has no fog u can see, thats 15 to 24 draws a frame for nothing on carousel, rat race n putput), n in performance mode the level's lightmap pass n its texture pass get drawn as 1 draw not 2 (17 to 29 less draws a frame on the heavy maps, 2 to 4 ms on 4 of em). theyll go upstream n then this folder is empty again
 
 seeing the picture w/o a tv: HALO_GLES2_SHOT=folder saves every 300th frame as a ppm. HALO_PERF_LOG=1 logs where each frame goes (world, objects, transparent, present...) w draws per part. HALO_PERF_AB freezes the game and flips script globals on n off to time them on the same picture. HALO_GLES2_MERGE_STATS=1 counts what each draw changes from the last one. HALO_GLES2_SLOW, _TRACE, _PROFILE and _EXPERIMENT are the gpu hang hunting tools (gles2_layer.c says what each does)
 

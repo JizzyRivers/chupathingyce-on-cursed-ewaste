@@ -773,6 +773,113 @@ Next to build, in order: (1) HUD quads merged; (2) outdoor view distance
 table with pictures; (3) phase 5's three frees; (4) object draws on
 damnation, carousel and boardingaction.
 
+## Round 5 (2026-11-15): profile, fog pass, and the single-pass level renderer
+
+Measured this round (box .80 unless said):
+
+- Profile (HALO_GLES2_PROFILE=file, carousel, 905 samples in 10 s, 90% of
+  the CPU): Vivante's libraries 42% (libGAL 28, libGLESv2 12.5, libVSC 1.5),
+  the game and the GL layer 39% (d3d8_gl.c 8.6, gles2_layer.c 4.3, tag
+  lookups about 5, texture_entry_result's menu and high-res lookups 2.2,
+  visibility about 3; no function over 3.4), ioctl from libGAL 12%. No hot
+  spot. The profiler stalls a map's load when shaders are being written
+  (hangemhigh and bloodgulch never reached play with it on).
+- The level's fog pass (structure_render_fog) is drawn every frame, fog or
+  not: patch 0003 leaves it out where no fog can show, and performance mode
+  no longer adds its own fog to a small level. Carousel 137 to 115 draws,
+  ratrace 103 to 88, putput 46 to 40; no other multiplayer map changes
+  (wizard, prisoner, chillout, damnation have fog of their own).
+- Specular and reflection passes are already off in performance mode.
+- Index uploads kept between passes (the same indices are uploaded by each
+  pass): no change in ms on carousel, damnation, boardingaction, chillout.
+  Not kept. Add to "do not retry".
+- Box .159 (release views), fog build before the thin-fog test: hangemhigh
+  31.6, putput 30.8, beavercreek 33.4, longest 34.2, ratrace 36.2,
+  bloodgulch 37.8, sidewinder 40.9, chillout 42.2, prisoner 43.2, wizard
+  48.5, boardingaction 59.9, damnation 63.5, carousel 72.6 ms.
+
+### Design: lightmap and texture passes as one draw ("fused")
+
+Why: the level's geometry is drawn once for lightmaps and once for
+textures; 60 to 100 of a slow map's draws. One draw for both should save
+13 to 18 ms there (a guess from 0.3 ms a draw saved).
+
+What the two passes are (rasterizer_xbox_environment.c):
+
+- Lightmap (A): vertex shader 16 (dump: vs017), two streams (the
+  geometry's and the lightmap's), textures 0 bump, 1 self illumination,
+  2 lightmap, 3 normalization cube (2 and 3 are set once a lightmap and
+  once a pass, not per draw); opaque, depth LESSEQUAL and written, alpha
+  test per shader (reference 0x7F), all color channels written.
+  Constants c[12..14] (registers -84..-82) are its texture transform.
+- Texture (B): vertex shader 40 (dump: vs041: position, and four
+  coordinates made from v4 with c[12..14]), one stream, textures 0 base,
+  1 and 2 detail, 3 micro detail; blend DESTCOLOR, ZERO (the product),
+  depth EQUAL, not written, stencil mode 5, alpha written only with
+  environment_specular_mask_enabled. Sets c[12..14] to other values.
+- Between them in render.c: object shadows, diffuse lights, light and
+  alpha-tested decals. Lights and decals are off in performance mode;
+  shadows multiply, so they can come after the product.
+
+Plan:
+
+1. Game: a structure_render_fused() in the lightmap pass's place when
+   performance mode is on, and no structure_render_diffuse_texture(). For
+   each chunk: set stages 2 and 3 again (B overwrote them), call the
+   lightmap draw with the D3D layer capturing (d3d8_gl_fuse_capture), then
+   the texture draw's own setup, whose draw becomes the fused one. The
+   render state stays the lightmap pass's throughout (B's draw function
+   sets no render state), with stencil mode 5 around the pass.
+2. d3d8_gl.c: at capture, A's program, pixel key, converted uniforms,
+   c[12..18], draw parameters and stream sources are kept and A's textures
+   bound on units 0 to 3. At B's draw, B's textures go on units 4 to 7
+   (a unit base in bind_textures and configure_sampler), and a fused
+   program is made from text: A's vertex shader plus B's four coordinates
+   computed from v4_in with three uniforms of their own (two packed
+   varyings), only when B's shader is the known one; A's pixel shader with
+   B's main as a function (tex0..3 to tex4..7, xT0..3 to the packed
+   varyings, xD0/xD1 to (0,0,0,1), xFog to 1, texture_scale and
+   texture_lod_bias to copies; refused if B discards or uses bump or
+   constants) and fragment_color multiplied by its result. Where a pair
+   cannot be fused or does not link (GC1000's shader size), the two draws
+   are made as before, B's with the texture pass's blend and depth state
+   forced for that draw.
+3. gles2_layer.c: should need nothing but units 4 to 7 (it has 16); B's
+   lookups are written as texture(texN, coordinate, bias) with no "(" form,
+   so the border and divide rewrites leave them alone.
+4. Check: frame 900 screenshots against the two-pass build on every
+   multiplayer map (the same spawn view: pixel difference), then ms.
+
+### Result: the fused pass (patch 0004), box .80, 2026-11-15
+
+Built as designed; every pair on the six maps below made one program (no
+"not one program" line). Draws and ms a frame, two passes (with the fog
+change) against fused:
+
+| Map | Draws | ms a frame |
+|---|---|---|
+| carousel | 115 to 93 | 59.3 to 56.9 |
+| damnation | 114 to 94 | 68.0 to 65.7 |
+| boardingaction | 123 to 94 | 50.3 to 47.0 |
+| wizard | 114 to 88 | 47.6 to 44.0 |
+| chillout | 101 to 84 | 41.7 to 41.9 |
+| prisoner | 94 to 84 | 42.4 to 42.4 |
+
+Carousel's frame 900 against the two-pass build's: the level differs by
+rounding (1 to 3 of 255); the pixels that differ more are the first-person
+weapon and the motion tracker, which move with the frame's time. Shadows:
+their blend is ZERO, INVSRCCOLOR (a multiply), so drawn after the product
+they give the same; not looked at in a picture. HALO_GLES2_NO_FUSE draws
+the two passes as before.
+
+Reading: 17 to 29 fewer draws are worth 0 to 3.6 ms, about 0.1 ms a draw
+and nothing on two maps. "0.45 ms a draw, whatever it draws" does not hold
+for these: a fused draw still sets eight textures, both passes' state and
+both shaders' constants, in the game, the D3D layer and the driver. The
+cost follows what a draw sets, not the draw call. Next: measure what each
+kind of call costs (texture binds, sampler states, attribute pointers,
+constants, the draw itself) by leaving each out in turn in the GL layer.
+
 ## Do not retry (measured, no gain or worse)
 
 - `VIV_NO_MT=1`: frames went from 42 to 69 ms and the game would not quit.
