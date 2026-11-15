@@ -1,0 +1,86 @@
+diff --git a/source/rasterizer/xbox/rasterizer_xbox_environment_fog.c b/source/rasterizer/xbox/rasterizer_xbox_environment_fog.c
+index ce8fc3b71..76fedc038 100644
+--- a/source/rasterizer/xbox/rasterizer_xbox_environment_fog.c
++++ b/source/rasterizer/xbox/rasterizer_xbox_environment_fog.c
+@@ -140,6 +140,9 @@ symbols in this file:
+ #include "rasterizer/rasterizer_model_types.h"
+ #include "rasterizer/rasterizer_transparent_geometry.h"
+ #include "render/render.h"
++#include "scenario/scenario.h"
++#include "structures/structure_bsp_definitions.h"
++#include <math.h>
+ #include "shaders/shader_definitions.h"
+ #include "shaders/shaders.h"
+ #include <stddef.h>
+@@ -595,12 +598,61 @@ void rasterizer_environment_fog_screen_model_end(
+ 
+ /* ---------- private code */
+ 
++/* port: whether this frame's fog pass can change a pixel. With no planar
++fog and an atmospheric fog that is none (density 0: ratrace) or too thin to
++reach a thousandth anywhere in the level (carousel's: 0.001 at 10000 units,
++in a level 46 across), every fragment's alpha rounds to 0 and the alpha
++test drops it, yet the pass was a draw for each of the level's materials
++in view. */
++static boolean environment_fog_visible = TRUE;
++
++static boolean environment_fog_can_show(
++	void)
++{
++	struct render_fog const *fog = &global_window_parameters.fog;
++	struct structure_bsp *structure_bsp = global_structure_bsp_get();
++	real x, y, z, reach, range, density;
++
++	if (fog->planar_maximum_density > 0.0f)
++	{
++		return TRUE;
++	}
++	if (fog->atmospheric_maximum_density <= 0.0f)
++	{
++		return FALSE;
++	}
++	if (!structure_bsp)
++	{
++		return TRUE;
++	}
++	/* (nothing in the level is further from the camera than its bounds'
++	diagonal, with the camera inside them: twice that, for one outside) */
++	x = structure_bsp->world_bounds.x1 - structure_bsp->world_bounds.x0;
++	y = structure_bsp->world_bounds.y1 - structure_bsp->world_bounds.y0;
++	z = structure_bsp->world_bounds.z1 - structure_bsp->world_bounds.z0;
++	reach = 2.0f * (fabsf(x) + fabsf(y) + fabsf(z));
++	range = fog->atmospheric_maximum_distance - fog->atmospheric_minimum_distance;
++	if (range <= 0.0f || reach <= fog->atmospheric_minimum_distance)
++	{
++		return reach > fog->atmospheric_minimum_distance;
++	}
++	density = fog->atmospheric_maximum_density * (reach - fog->atmospheric_minimum_distance) / range;
++	return density >= 0.001f;
++}
++
+ void _rasterizer_environment_fog_begin(
+ 	void)
+ {
+ 	real atmospheric_eye_density;
+ 	real planar_eye_density;
+ 
++	environment_fog_visible = environment_fog_can_show();
++	if (!environment_fog_visible)
++	{
++		rasterizer_profile_begin(_rasterizer_profile_environment_fog);
++		return;
++	}
++
+ 	match_assert(
+ 		"c:\\halo\\SOURCE\\rasterizer\\xbox\\rasterizer_xbox_environment_fog.c",
+ 		290,
+@@ -726,7 +778,8 @@ void _rasterizer_environment_fog_draw(
+ 		423,
+ 		global_d3d_device);
+ 	if (rasterizer_debug_options.drawing_mode == _rasterizer_drawing_mode_normal &&
+-		rasterizer_debug_options.draw_environment_fog)
++		rasterizer_debug_options.draw_environment_fog &&
++		environment_fog_visible)
+ 	{
+ 		match_assert(
+ 			"c:\\halo\\SOURCE\\rasterizer\\xbox\\rasterizer_xbox_environment_fog.c",

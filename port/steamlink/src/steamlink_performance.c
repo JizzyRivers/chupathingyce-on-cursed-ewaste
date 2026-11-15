@@ -45,6 +45,7 @@ it goes off.
 #include "rasterizer/rasterizer_console_vars.h"
 #include "scenario/scenario.h"
 #include "scenario/scenario_definitions.h"
+#include "structures/structure_bsp_definitions.h"
 
 /* (port_config.c's, as the game's own sources declare it) */
 int config_boolean(const char *name);
@@ -120,10 +121,44 @@ long console_performance_lines(void)
 	return performance_on ? config_integer("display.performance_lines") : 0;
 }
 
+void platform_log(char const *format, ...);
+
+/* whether the level is small beside the distance (its bounds' diagonal is
+under one and a half times it): then the distance cuts next to nothing
+(the draws of carousel, damnation and chillout are the same from 30 to 90),
+and its fog hides nothing: without it a level with no fog of its own that
+shows (carousel, ratrace, putput) is drawn without the fog pass, 6 to 24
+draws a frame (patches/chupathingyce/0003) */
+static boolean performance_level_fits(real distance)
+{
+	static struct structure_bsp *known;
+	static real diagonal_squared;
+	struct structure_bsp *structure_bsp = global_structure_bsp_get();
+
+	if (!structure_bsp)
+		return FALSE;
+	if (structure_bsp != known)
+	{
+		real x = structure_bsp->world_bounds.x1 - structure_bsp->world_bounds.x0;
+		real y = structure_bsp->world_bounds.y1 - structure_bsp->world_bounds.y0;
+		real z = structure_bsp->world_bounds.z1 - structure_bsp->world_bounds.z0;
+
+		known = structure_bsp;
+		diagonal_squared = x * x + y * y + z * z;
+		platform_log("performance: the level is %.0f by %.0f by %.0f units", (double)x, (double)y, (double)z);
+	}
+	return diagonal_squared > 0.0f && diagonal_squared < distance * distance * 2.25f;
+}
+
 /* how far the camera sees, 0 for as far as the level does */
 real console_performance_view_distance(void)
 {
-	return performance_cutting() ? (real)config_real("display.performance_view_distance") : 0.0f;
+	real distance;
+
+	if (!performance_cutting())
+		return 0.0f;
+	distance = (real)config_real("display.performance_view_distance");
+	return distance > 0.0f && performance_level_fits(distance) ? 0.0f : distance;
 }
 
 /* what a model's size on the screen is multiplied by when its detail is
