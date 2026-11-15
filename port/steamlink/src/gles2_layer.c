@@ -1202,6 +1202,15 @@ static void index_range(GLenum type, const void *indices, GLsizei count, unsigne
 }
 
 static GLuint program_current;
+/* (the renderer's program made the driver's again after the layer's own; a
+lazy program not yet loaded is not the driver's to use, program_ready) */
+static int program_is_pending(GLuint program);
+static void program_ready(GLuint program);
+static void program_current_restore(void)
+{
+	if (!program_is_pending(program_current))
+		real.UseProgram(program_current);
+}
 static GLuint read_framebuffer, draw_framebuffer;
 /* each framebuffer's color texture (feedback_begin) */
 static GLuint framebuffer_colors[LAYER_TRACKED];
@@ -1390,7 +1399,7 @@ static GLuint shared_copy_get(GLuint name)
 		if (current->enabled & (1u << index))
 			real.EnableVertexAttribArray(index);
 	}
-	real.UseProgram(program_current);
+	program_current_restore();
 	real.BindFramebuffer(GL_FRAMEBUFFER, draw_framebuffer);
 	halo_glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
 	halo_glColorMask(mask[0], mask[1], mask[2], mask[3]);
@@ -1841,6 +1850,7 @@ static void draw_flush_maybe(void)
 
 static void GL_APIENTRY layer_DrawArrays(GLenum mode, GLint first, GLsizei count)
 {
+	program_ready(program_current);
 	merge_stats_draw(program_current);
 	counts.draws++;
 	draws_total++;
@@ -1915,6 +1925,7 @@ static void client_vertices_count(GLenum type, const void *indices, GLsizei coun
 
 static void GL_APIENTRY layer_DrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
+	program_ready(program_current);
 	merge_stats_draw(program_current);
 	counts.draws++;
 	draws_total++;
@@ -3999,11 +4010,173 @@ static void GL_APIENTRY layer_GetShaderiv(GLuint shader, GLenum pname, GLint *pa
 	real_GetShaderiv(shader, pname, params);
 }
 
+/* Lazy programs. The renderer's shader cache links every program it has ever
+drawn at each start (xgpu_shader_cache_warm) and asks each for its uniforms:
+on a box that has been played, hundreds of programs, half a minute and tens
+of megabytes for programs most sessions never draw. A program whose binary is
+on the stick is therefore linked in name only: its link status is true, its
+uniforms get locations of the layer's own (LAZY_LOCATION + a slot), its
+samplers' units are kept, and the binary is loaded at its first draw or
+first other uniform (program_ready). HALO_GLES2_EAGER links all at once, as
+before. */
+#define LAZY_LOCATION 0x200000
+#define LAZY_SLOTS 96
+
+struct lazy_program
+{
+	int pending, wants_constants;
+	GLuint fragment;
+	int count;
+	/* each slot: its name (lazy_names'), the driver's location once
+	loaded, and a glUniform1i kept for then */
+	unsigned char names[LAZY_SLOTS];
+	unsigned char has_value[LAZY_SLOTS];
+	GLint locations[LAZY_SLOTS];
+	GLint values[LAZY_SLOTS];
+};
+
+static struct lazy_program *lazy_programs[LAYER_TRACKED];
+static char *lazy_names[256];
+static int lazy_name_count;
+static struct
+{
+	unsigned long deferred, readied;
+} lazy_counts;
+static void (GL_APIENTRY *real_GetProgramiv)(GLuint, GLenum, GLint *);
+static void (GL_APIENTRY *real_Uniform1i)(GLint, GLint);
+static void (GL_APIENTRY *real_Uniform1f)(GLint, GLfloat);
+static void (GL_APIENTRY *real_Uniform2f)(GLint, GLfloat, GLfloat);
+static void program_link_finish(GLuint program, GLuint attached_fragment);
+static int constants_split_build(GLuint program);
+static __typeof__(halo_glGetUniformLocation) real_GetUniformLocation;
+
+static int lazy_on(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = program_binaries_on() && !getenv("HALO_GLES2_EAGER");
+	return on;
+}
+
+static struct lazy_program *lazy_pending(GLuint program)
+{
+	return program < LAYER_TRACKED && lazy_programs[program] && lazy_programs[program]->pending ?
+		lazy_programs[program] : NULL;
+}
+
+static int program_is_pending(GLuint program)
+{
+	return lazy_pending(program) != NULL;
+}
+
+/* a name's number among the lazy programs' uniform names, -1 for no room */
+static int lazy_name(const char *name)
+{
+	int index;
+
+	for (index = 0; index < lazy_name_count; index++)
+	{
+		if (!strcmp(lazy_names[index], name))
+			return index;
+	}
+	if (lazy_name_count == 256 || !(lazy_names[lazy_name_count] = strdup(name)))
+		return -1;
+	return lazy_name_count++;
+}
+
+/* a lazy program loaded now, with what was asked of it meanwhile */
+static void program_ready(GLuint program)
+{
+	struct lazy_program *lazy = lazy_pending(program);
+	int slot;
+
+	if (!lazy)
+		return;
+	lazy->pending = 0;
+	if (lazy_counts.readied++ % 50 == 0)
+		platform_log("gles2: lazy programs: %lu loaded of %lu left for their first draw", lazy_counts.readied,
+			lazy_counts.deferred);
+	program_link_finish(program, lazy->fragment);
+	if (lazy->wants_constants)
+		constants_split_build(program);
+	real.UseProgram(program);
+	for (slot = 0; slot < lazy->count; slot++)
+	{
+		lazy->locations[slot] = real_GetUniformLocation(program, lazy_names[lazy->names[slot]]);
+		if (lazy->has_value[slot] && lazy->locations[slot] >= 0)
+			real_Uniform1i(lazy->locations[slot], lazy->values[slot]);
+	}
+	if (program_current != program)
+		real.UseProgram(lazy_pending(program_current) ? 0 : program_current);
+}
+
+/* a uniform's location as the driver has it: a lazy program's slot is its
+program's own (the current program's, loaded if it was not) */
+static GLint lazy_location(GLint location)
+{
+	struct lazy_program *lazy;
+
+	/* (the driver's own: of a program that is loaded, the layer's blit too) */
+	if (location < LAZY_LOCATION || location >= LAZY_LOCATION + LAZY_SLOTS)
+		return location;
+	lazy = program_current < LAYER_TRACKED ? lazy_programs[program_current] : NULL;
+	if (!lazy || location - LAZY_LOCATION >= lazy->count)
+		return -1;
+	program_ready(program_current);
+	return lazy->locations[location - LAZY_LOCATION];
+}
+
+static void GL_APIENTRY layer_GetProgramiv(GLuint program, GLenum pname, GLint *params)
+{
+	if (pname == GL_LINK_STATUS && lazy_pending(program))
+	{
+		*params = GL_TRUE;
+		return;
+	}
+	program_ready(program);
+	real_GetProgramiv(program, pname, params);
+}
+
+static void GL_APIENTRY layer_Uniform1i(GLint location, GLint value)
+{
+	struct lazy_program *lazy = lazy_pending(program_current);
+
+	/* (a sampler's unit, given when the program is adopted: kept) */
+	if (lazy && location >= LAZY_LOCATION && location < LAZY_LOCATION + lazy->count)
+	{
+		lazy->has_value[location - LAZY_LOCATION] = 1;
+		lazy->values[location - LAZY_LOCATION] = value;
+		return;
+	}
+	location = lazy_location(location);
+	if (location >= 0)
+		real_Uniform1i(location, value);
+}
+
+static void GL_APIENTRY layer_Uniform1f(GLint location, GLfloat x)
+{
+	location = lazy_location(location);
+	if (location >= 0)
+		real_Uniform1f(location, x);
+}
+
+static void GL_APIENTRY layer_Uniform2f(GLint location, GLfloat x, GLfloat y)
+{
+	location = lazy_location(location);
+	if (location >= 0)
+		real_Uniform2f(location, x, y);
+}
+
 static void GL_APIENTRY layer_LinkProgram(GLuint program)
 {
-	static int reported;
-	GLint linked = 0;
 	GLuint attached_fragment = 0;
+
+	if (program < LAYER_TRACKED && lazy_programs[program])
+	{
+		free(lazy_programs[program]);
+		lazy_programs[program] = NULL;
+	}
 
 	if (program < LAYER_TRACKED && program_vertex_shaders[program])
 	{
@@ -4042,6 +4215,42 @@ static void GL_APIENTRY layer_LinkProgram(GLuint program)
 			real.AttachShader(program, copy);
 		}
 	}
+	/* (its binary is on the stick: linked at its first use, program_ready) */
+	if (lazy_on() && attached_fragment && program_vertex_shaders[program])
+	{
+		char path[1100];
+		FILE *file;
+
+		snprintf(path, sizeof(path), "%s/%016llx.bin", program_binaries.folder,
+			program_key(program_vertex_shaders[program], attached_fragment));
+		file = fopen(path, "rb");
+		if (file)
+		{
+			struct lazy_program *lazy = calloc(1, sizeof(*lazy));
+
+			fclose(file);
+			if (lazy)
+			{
+				lazy->pending = 1;
+				lazy->fragment = attached_fragment;
+				lazy_programs[program] = lazy;
+				lazy_counts.deferred++;
+				free(constant_split[program]);
+				constant_split[program] = NULL;
+				memset(&border_programs[program], 0, sizeof(border_programs[program]));
+				return;
+			}
+		}
+	}
+	program_link_finish(program, attached_fragment);
+}
+
+/* the link itself, and what the layer keeps of a linked program */
+static void program_link_finish(GLuint program, GLuint attached_fragment)
+{
+	static int reported;
+	GLint linked = 0;
+
 	counts.links++;
 	linked = program_link(program, program < LAYER_TRACKED ? program_vertex_shaders[program] : 0,
 		attached_fragment ? attached_fragment : (program < LAYER_TRACKED ? program_fragment_shaders[program] : 0));
@@ -4104,7 +4313,6 @@ static void GL_APIENTRY layer_LinkProgram(GLuint program)
 
 /* (the driver's own, which layer_GetUniformLocation and layer_Uniform4fv
 stand in front of for c[]) */
-static __typeof__(halo_glGetUniformLocation) real_GetUniformLocation;
 static __typeof__(halo_glUniform4fv) real_Uniform4fv;
 
 /* the current program's border uniforms, from the samplers on units 0 to 3,
@@ -4162,12 +4370,10 @@ struct constant_split
 
 static GLint GL_APIENTRY layer_GetUniformLocation(GLuint program, const GLchar *name)
 {
-	struct constant_split *split;
-	int index, any;
 
 	/* c[N], as the renderer probes c[]'s length after asking for c: the
 virtual location's Nth, all 192 (its uploads go where each is) */
-	if (program < LAYER_TRACKED && !strncmp(name, "c[", 2) && constant_split[program])
+	if (program < LAYER_TRACKED && !strncmp(name, "c[", 2) && (constant_split[program] || lazy_pending(program)))
 	{
 		char *end;
 		long index = strtol(name + 2, &end, 10);
@@ -4175,13 +4381,46 @@ virtual location's Nth, all 192 (its uploads go where each is) */
 		if (*end == ']' && index >= 0 && index < 192)
 			return CONSTANTS_VIRTUAL_LOCATION + (GLint)index;
 	}
+	if (lazy_pending(program))
+	{
+		struct lazy_program *lazy = lazy_programs[program];
+		int number, slot;
+
+		if (!strcmp(name, "c"))
+		{
+			lazy->wants_constants = 1;
+			return CONSTANTS_VIRTUAL_LOCATION;
+		}
+		number = lazy_name(name);
+		for (slot = 0; number >= 0 && slot < lazy->count; slot++)
+		{
+			if (lazy->names[slot] == number)
+				return LAZY_LOCATION + slot;
+		}
+		if (number >= 0 && lazy->count < LAZY_SLOTS)
+		{
+			lazy->names[lazy->count] = (unsigned char)number;
+			return LAZY_LOCATION + lazy->count++;
+		}
+		/* (no room to keep it: loaded after all) */
+		program_ready(program);
+	}
 	if (program >= LAYER_TRACKED || strcmp(name, "c"))
 		return real_GetUniformLocation(program, name);
+	return constants_split_build(program) ? CONSTANTS_VIRTUAL_LOCATION : -1;
+}
+
+/* a program's c[] found: where each constant went. Whether it has any */
+static int constants_split_build(GLuint program)
+{
+	struct constant_split *split;
+	int index, any;
+
 	if (!constant_split[program])
 		constant_split[program] = calloc(1, sizeof(struct constant_split));
 	split = constant_split[program];
 	if (!split)
-		return -1;
+		return 0;
 	split->bones = real_GetUniformLocation(program, "c_bones");
 	any = split->bones >= 0;
 	for (index = 0; index < 192; index++)
@@ -4200,7 +4439,7 @@ virtual location's Nth, all 192 (its uploads go where each is) */
 			platform_log("gles2 constants: program %u: c_0 %d, c_58 %d, bones %d, %s", program, split->named[0],
 				split->named[58], split->bones, any ? "split" : "none");
 	}
-	return any ? CONSTANTS_VIRTUAL_LOCATION : -1;
+	return any;
 }
 
 /* HALO_GLES2_CONSTANT_LOG, -1 before it is looked up */
@@ -4214,9 +4453,12 @@ static void GL_APIENTRY layer_Uniform4fv(GLint location, GLsizei count, const GL
 	counts.uniforms++;
 	if (location < CONSTANTS_VIRTUAL_LOCATION || location >= CONSTANTS_VIRTUAL_LOCATION + 192)
 	{
-		real_Uniform4fv(location, count, values);
+		location = lazy_location(location);
+		if (location >= 0)
+			real_Uniform4fv(location, count, values);
 		return;
 	}
+	program_ready(program_current);
 	split = program_current < LAYER_TRACKED ? constant_split[program_current] : NULL;
 	/* (looked up once: this is every upload, hundreds a frame, and getenv
 	walks the whole environment) */
@@ -4592,7 +4834,8 @@ static void GL_APIENTRY layer_UseProgram(GLuint program)
 {
 	program_current = program;
 	counts.programs++;
-	real.UseProgram(program);
+	if (!lazy_pending(program))
+		real.UseProgram(program);
 }
 
 /* ---------- the Android host's GL helpers (xgpu.h) */
@@ -4940,8 +5183,16 @@ int console_gles2_layer(void)
 	LAYER_REPLACE(UseProgram);
 	real_GetUniformLocation = halo_glGetUniformLocation;
 	real_Uniform4fv = halo_glUniform4fv;
+	real_GetProgramiv = halo_glGetProgramiv;
+	real_Uniform1i = halo_glUniform1i;
+	real_Uniform1f = halo_glUniform1f;
+	real_Uniform2f = halo_glUniform2f;
 	LAYER_REPLACE(GetUniformLocation);
 	LAYER_REPLACE(Uniform4fv);
+	LAYER_REPLACE(GetProgramiv);
+	LAYER_REPLACE(Uniform1i);
+	LAYER_REPLACE(Uniform1f);
+	LAYER_REPLACE(Uniform2f);
 	LAYER_REPLACE(GenQueries);
 	LAYER_REPLACE(BeginQuery);
 	LAYER_REPLACE(EndQuery);
