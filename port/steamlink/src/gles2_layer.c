@@ -4893,7 +4893,7 @@ to the log, for llvm-symbolizer against the unstripped executable. */
 #include <unistd.h>
 #include <ucontext.h>
 
-#define PROFILE_SLOTS 4096
+#define PROFILE_SLOTS 65536
 
 static volatile unsigned int profile_pcs[PROFILE_SLOTS], profile_counts[PROFILE_SLOTS];
 static volatile unsigned int profile_total;
@@ -4960,6 +4960,22 @@ by function off the box) */
 
 		if (file)
 		{
+			/* (where each library is, for the pcs: once, beside the file) */
+			static int mapped;
+			char maps_path[1100], text[4096];
+			FILE *maps = mapped ? NULL : fopen("/proc/self/maps", "r"), *copy;
+			size_t length;
+
+			snprintf(maps_path, sizeof(maps_path), "%s.maps", path);
+			if (maps && (copy = fopen(maps_path, "w")))
+			{
+				while ((length = fread(text, 1, sizeof(text), maps)) > 0)
+					fwrite(text, 1, length, copy);
+				fclose(copy);
+				mapped = 1;
+			}
+			if (maps)
+				fclose(maps);
 			fprintf(file, "samples %u\n", total);
 			for (slot = 0; slot < PROFILE_SLOTS; slot++)
 			{
