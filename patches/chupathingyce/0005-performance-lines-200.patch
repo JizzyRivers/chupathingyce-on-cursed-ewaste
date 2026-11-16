@@ -1,0 +1,17 @@
+diff --git a/port/linux/src/port_config.c b/port/linux/src/port_config.c
+index 11ea637ea..16597dfb4 100644
+--- a/port/linux/src/port_config.c
++++ b/port/linux/src/port_config.c
+@@ -375,10 +375,10 @@ static const struct config_setting config_settings[] =
+ 		"Start in performance mode: the level drawn without its decals, dynamic lights, reflections and specular\n"
+ 		"highlights, and no lens flares, for the frame rate. Hold Back and press down on the d-pad (or F9) to switch\n"
+ 		"it in the game." },
+-	{ "display.performance_lines", _config_integer, "240", "HALO_PERFORMANCE_LINES", _environment_value,
++	{ "display.performance_lines", _config_integer, "200", "HALO_PERFORMANCE_LINES", _environment_value,
+ 		_platform_all,
+ 		"The lines the picture is drawn with in performance mode, scaled up to the screen: 480 is the game's own,\n"
+-		"240 a quarter of the pixels." },
++		"240 a quarter of the pixels, 200 (the default) a little over a sixth." },
+ 	{ "display.performance_view_distance", _config_real, "60.0", "HALO_PERFORMANCE_VIEW_DISTANCE",
+ 		_environment_value, _platform_all,
+ 		"How far performance mode sees, in the game's units (about 3 m): fog thickens to the distance and nothing\n"

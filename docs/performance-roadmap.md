@@ -880,6 +880,35 @@ cost follows what a draw sets, not the draw call. Next: measure what each
 kind of call costs (texture binds, sampler states, attribute pointers,
 constants, the draw itself) by leaving each out in turn in the GL layer.
 
+### Where a frame goes, and 200 lines (2026-11-15)
+
+Frozen picture (HALO_PERF_AB), layer_experiment bits: 4 draws nothing (all
+state still set), 64 draws into one pixel, 128 draws one triangle a draw,
+256 no constants, 512 no sampler states, 1024 no texture binds:
+
+- Nothing drawn: 16 to 20 ms on every map (the game, sound, the present).
+- One pixel: hangemhigh 33.4 to 22.1, bloodgulch 33.5 to 27.5, wizard
+  44.5 to 38.9, damnation 57 to 53; chillout, prisoner, carousel,
+  boardingaction within noise. Open maps pay for pixels.
+- Constants, sampler states, texture binds: within noise each.
+- Per part (box .159, rasterizer_* globals off): the level 12 ms on
+  hangemhigh and bloodgulch, 20 on wizard, 26 on damnation; its fog 6 to 9
+  ms; HUD, shadows, transparents, effects, bump, detail objects in noise.
+- Each draw's call timed (HALO_GLES2_DRAW_TIMES, HALO_GLES2_DRAW_LOG): a
+  draw that changes program takes 0.35 to 0.45 ms in the driver, one that
+  does not under 0.1. A regression over 7000 draws is weak (R2 0.46).
+- The driver's kernel calls (tools/box/shim/ioctl_count.so as LD_PRELOAD):
+  one command 35 a draw (about 0.04 ms), command 19 about 16 a frame
+  (commits, about 2 ms a frame).
+- Index pages rewritten every frame kept in the mirror anyway
+  (HALO_GLES2_MIRROR_ALL, not kept): no change.
+
+performance_lines (box .159, ms a frame): 240 against 200 against 160:
+hangemhigh 32.4 / 28.1 / 24.3, beavercreek 35.5 / 31.3 / 29.6, bloodgulch
+37.6 / 34.6 / 33.0, sidewinder 42.8 / 36.9 / 34.0, longest 37.2 / 31.6,
+putput 30.1 / 28.0, prisoner 44.1 / 41.3, ratrace, chillout, carousel,
+boardingaction, damnation the same. The default is 200 (patch 0005).
+
 ## Do not retry (measured, no gain or worse)
 
 - `VIV_NO_MT=1`: frames went from 42 to 69 ms and the game would not quit.

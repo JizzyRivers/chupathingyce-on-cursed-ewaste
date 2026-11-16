@@ -378,11 +378,18 @@ sampler override them only while it is bound): without that, a texture bound
 for a moment on a unit with a sampler keeps the sampler's filter, and one
 with no smaller levels (the overlay's text atlas, uploaded to wherever the
 game left its units) is then incomplete, and samples black. 0: never set */
+/* (HALO_GLES2_EXPERIMENT's bits, below: 256, no constants uploaded; 512, no
+sampler state set; 1024, no texture bound. For what each costs on a frozen
+picture, HALO_PERF_AB's layer_experiment) */
+static unsigned int experiment_bits;
+
 static void sampler_apply(GLuint unit)
 {
 	struct layer_sampler *sampler = NULL;
 	int slot;
 
+	if (experiment_bits & 512)
+		return;
 	if (unit >= LAYER_TEXTURE_UNITS)
 		return;
 	if (unit_samplers[unit] && unit_samplers[unit] < LAYER_TRACKED)
@@ -446,7 +453,8 @@ static GLuint texture_white;
 static void GL_APIENTRY layer_BindTexture(GLenum target, GLuint texture)
 {
 	counts.texture_binds++;
-	real.BindTexture(target, texture || target != GL_TEXTURE_2D ? texture : texture_white);
+	if (!(experiment_bits & 1024))
+		real.BindTexture(target, texture || target != GL_TEXTURE_2D ? texture : texture_white);
 	if (active_unit < LAYER_TEXTURE_UNITS && (target == GL_TEXTURE_2D || target == GL_TEXTURE_CUBE_MAP))
 	{
 		unit_textures[active_unit][target_slot(target)] = texture;
@@ -1923,6 +1931,120 @@ static void client_vertices_count(GLenum type, const void *indices, GLsizei coun
 	}
 }
 
+/* HALO_GLES2_DRAW_TIMES: how long the driver's draw calls take, by program:
+every 300 frames the eight programs whose indexed draws took longest, with
+their draws and indices a frame (draw_times_frame, from the present) */
+#define DRAW_TIME_PROGRAMS 512
+static struct
+{
+	unsigned long draws, indices, client;
+	Uint64 ns;
+} draw_times[DRAW_TIME_PROGRAMS];
+static int draw_timing = -1;
+
+static void draw_times_frame(void)
+{
+	static unsigned long frames;
+	int pass, index;
+	Uint64 total = 0;
+	unsigned long draws = 0;
+
+	if (draw_timing <= 0 || ++frames % 300)
+		return;
+	for (index = 0; index < DRAW_TIME_PROGRAMS; index++)
+	{
+		total += draw_times[index].ns;
+		draws += draw_times[index].draws;
+	}
+	platform_log("gles2 draw times: %.2f ms a frame in %lu indexed draws a frame", (double)total / 300.0e6, draws / 300);
+	for (pass = 0; pass < 8; pass++)
+	{
+		int best = -1;
+
+		for (index = 0; index < DRAW_TIME_PROGRAMS; index++)
+		{
+			if (draw_times[index].ns && (best < 0 || draw_times[index].ns > draw_times[best].ns))
+				best = index;
+		}
+		if (best < 0)
+			break;
+		platform_log("gles2 draw times: program %d: %.2f ms a frame, %.1f draws (%.1f from client indices), %.0f indices, %.0f us a draw",
+			best, (double)draw_times[best].ns / 300.0e6, (double)draw_times[best].draws / 300.0,
+			(double)draw_times[best].client / 300.0, (double)draw_times[best].indices / 300.0,
+			(double)draw_times[best].ns / 1000.0 / (double)draw_times[best].draws);
+		draw_times[best].ns = 0;
+	}
+	memset(draw_times, 0, sizeof(draw_times));
+}
+
+/* HALO_GLES2_DRAW_LOG=file: every indexed draw of frames 900 to 1000, a line
+each: the nanoseconds its draw call took, and what was set since the draw
+before it (programs, texture binds, texture parameters, uniform calls,
+attribute pointers, framebuffers), whether its indices were the client's,
+how many, and its program. For fitting what each kind of change costs. */
+#define DRAW_LOG_ROWS 16384
+static struct draw_log_row
+{
+	unsigned int ns, program;
+	unsigned short programs, binds, parameters, uniforms, pointers, framebuffers, client;
+	unsigned int indices;
+} *draw_log_rows;
+static unsigned long draw_log_count, draw_log_frame;
+static int draw_logging = -1;
+
+static void draw_log_add(Uint64 ns, int client, GLsizei indices)
+{
+	static unsigned long last[6];
+	struct draw_log_row *row;
+
+	if (draw_log_frame >= 900 && draw_log_frame < 1000 && draw_log_rows && draw_log_count < DRAW_LOG_ROWS)
+	{
+		row = &draw_log_rows[draw_log_count++];
+		row->ns = (unsigned int)ns;
+		row->program = program_current;
+		row->programs = (unsigned short)(counts.programs - last[0]);
+		row->binds = (unsigned short)(counts.texture_binds - last[1]);
+		row->parameters = (unsigned short)(counts.texture_parameters - last[2]);
+		row->uniforms = (unsigned short)(counts.uniforms - last[3]);
+		row->pointers = (unsigned short)(counts.pointers - last[4]);
+		row->framebuffers = (unsigned short)(counts.framebuffers - last[5]);
+		row->client = (unsigned short)client;
+		row->indices = (unsigned int)indices;
+	}
+	last[0] = counts.programs;
+	last[1] = counts.texture_binds;
+	last[2] = counts.texture_parameters;
+	last[3] = counts.uniforms;
+	last[4] = counts.pointers;
+	last[5] = counts.framebuffers;
+}
+
+static void draw_log_frame_end(void)
+{
+	if (draw_logging <= 0)
+		return;
+	if (!draw_log_rows)
+		draw_log_rows = calloc(DRAW_LOG_ROWS, sizeof(*draw_log_rows));
+	if (++draw_log_frame == 1000 && draw_log_rows)
+	{
+		FILE *file = fopen(getenv("HALO_GLES2_DRAW_LOG"), "w");
+		unsigned long index;
+
+		if (file)
+		{
+			for (index = 0; index < draw_log_count; index++)
+			{
+				const struct draw_log_row *row = &draw_log_rows[index];
+
+				fprintf(file, "%u %u %u %u %u %u %u %u %u %u%c", row->ns, row->program, row->programs, row->binds,
+					row->parameters, row->uniforms, row->pointers, row->framebuffers, row->client, row->indices, 10);
+			}
+			fclose(file);
+		}
+		platform_log("gles2: %lu draws logged", draw_log_count);
+	}
+}
+
 static void GL_APIENTRY layer_DrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
 	program_ready(program_current);
@@ -1970,8 +2092,17 @@ static void GL_APIENTRY layer_DrawElements(GLenum mode, GLsizei count, GLenum ty
 
 			GLsizei drawn = (experiment_bits & 128) && count > 3 ? 3 : count;
 
+			Uint64 draw_start = 0;
+
 			counts.index_count += (unsigned long)drawn;
 			client_vertices_count(type, indices, drawn);
+			if (draw_timing < 0)
+			{
+				draw_logging = getenv("HALO_GLES2_DRAW_LOG") != NULL;
+				draw_timing = getenv("HALO_GLES2_DRAW_TIMES") != NULL || draw_logging;
+			}
+			if (draw_timing)
+				draw_start = SDL_GetTicksNS();
 			if (elements && elements->gpu)
 			{
 				counts.gpu_indexed++;
@@ -1982,6 +2113,17 @@ static void GL_APIENTRY layer_DrawElements(GLenum mode, GLsizei count, GLenum ty
 			{
 				real.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 				real_DrawElements(mode, drawn, type, indices);
+			}
+			if (draw_timing)
+			{
+				unsigned int slot = program_current % DRAW_TIME_PROGRAMS;
+
+				draw_times[slot].ns += SDL_GetTicksNS() - draw_start;
+				draw_times[slot].draws++;
+				draw_times[slot].indices += (unsigned long)drawn;
+				draw_times[slot].client += !(elements && elements->gpu);
+				if (draw_logging > 0)
+					draw_log_add(SDL_GetTicksNS() - draw_start, !(elements && elements->gpu), drawn);
 			}
 			shared_units_end(shared);
 		}
@@ -2426,6 +2568,8 @@ static void GL_APIENTRY layer_BlitFramebuffer(GLint source_x0, GLint source_y0, 
 			period_start = now;
 		}
 		perf_ab(timed, now - last);
+	draw_times_frame();
+	draw_log_frame_end();
 		last = now;
 		screenshot_maybe(destination_x0 < destination_x1 ? destination_x0 : destination_x1,
 			destination_y0 < destination_y1 ? destination_y0 : destination_y1, abs(destination_x1 - destination_x0),
@@ -4451,6 +4595,8 @@ static void GL_APIENTRY layer_Uniform4fv(GLint location, GLsizei count, const GL
 	GLint first, index;
 
 	counts.uniforms++;
+	if (experiment_bits & 256)
+		return;
 	if (location < CONSTANTS_VIRTUAL_LOCATION || location >= CONSTANTS_VIRTUAL_LOCATION + 192)
 	{
 		location = lazy_location(location);
