@@ -19,17 +19,18 @@
     <application
         android:label="Chupathingy 32"
         android:icon="@mipmap/ic_launcher"
+        android:banner="@drawable/banner"
         android:allowBackup="false"
         android:isGame="true"
         android:extractNativeLibs="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
         android:hardwareAccelerated="true"
         android:enableOnBackInvokedCallback="false">
+        <!-- the launcher: starts the game, or asks for its data first (SetupActivity.java) -->
         <activity
-            android:name=".ChupathingyActivity"
+            android:name=".SetupActivity"
             android:exported="true"
             android:screenOrientation="sensorLandscape"
-            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -37,5 +38,12 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- the game: SDL3's activity (no launcher entry: adb can still start it) -->
+        <activity
+            android:name=".ChupathingyActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density" />
     </application>
 </manifest>

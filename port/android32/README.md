@@ -12,11 +12,14 @@ Tested: Amlogic S905W2 (Mali-G31, ES 3.2): Blood Gulch at about 40 fps; Echo Sho
 ## Install
 
 1. `adb install chupathingyce-android32-<version>.apk` (a build from `package.py`, below).
-2. Copy the Xbox maps (the `maps` folder of Halo's disc, with `ui.map`) to
-   `/sdcard/Android/data/dev.warman.chupathingyce32/files/maps/`, for example
-   `adb push maps /sdcard/Android/data/dev.warman.chupathingyce32/files/`. Without them the app says
-   so and quits. There is no install screen yet.
-3. Start "Chupathingy 32". A gamepad works as on the desktop. A device with a touchscreen gets the
+2. Start "Chupathingy 32". With no game data it shows a setup screen (large buttons, a remote's d-pad
+   reaches them): **Choose a disc image** (an Xbox disc image of Halo, .iso or .xiso, copied out by
+   `XisoExtractor`, upstream's reader) or **Choose a folder with the maps** (the Xbox's maps, with
+   `ui.map`, from a computer or a USB drive; copied `ui.map` first and then the smallest maps first as far
+   as the free space goes, so a device with 1.5 GB left still gets the multiplayer maps). Both use the
+   system's file picker, which opens in Downloads. Or copy them by hand, which the screen also says:
+   `adb push maps /sdcard/Android/data/dev.warman.chupathingyce32/files/`, then "check again".
+3. A gamepad works as on the desktop. A device with a touchscreen gets the
    on-screen controls (upstream's overlay; a compact layout on a small wide screen); a television
    does not. The first start makes the game's caches, which takes a while.
 
