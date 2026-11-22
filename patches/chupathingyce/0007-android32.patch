@@ -47,10 +47,84 @@ index 44b88eabe..d9e99f849 100644
  /* ES 3.2's; on 3.0 (iOS's newest) gl_initialize does without it */
  #define GL_ES_OPTIONAL_FUNCTION(name) !strcmp(#name, "glDrawElementsBaseVertex")
  #else
+diff --git a/port/linux/src/port_config.c b/port/linux/src/port_config.c
+index 11ea637ea..8a4f7f178 100644
+--- a/port/linux/src/port_config.c
++++ b/port/linux/src/port_config.c
+@@ -375,10 +375,10 @@ static const struct config_setting config_settings[] =
+ 		"Start in performance mode: the level drawn without its decals, dynamic lights, reflections and specular\n"
+ 		"highlights, and no lens flares, for the frame rate. Hold Back and press down on the d-pad (or F9) to switch\n"
+ 		"it in the game." },
+-	{ "display.performance_lines", _config_integer, "240", "HALO_PERFORMANCE_LINES", _environment_value,
++	{ "display.performance_lines", _config_integer, "200", "HALO_PERFORMANCE_LINES", _environment_value,
+ 		_platform_all,
+ 		"The lines the picture is drawn with in performance mode, scaled up to the screen: 480 is the game's own,\n"
+-		"240 a quarter of the pixels." },
++		"240 a quarter of the pixels, 200 (the default) a little over a sixth." },
+ 	{ "display.performance_view_distance", _config_real, "60.0", "HALO_PERFORMANCE_VIEW_DISTANCE",
+ 		_environment_value, _platform_all,
+ 		"How far performance mode sees, in the game's units (about 3 m): fog thickens to the distance and nothing\n"
+@@ -2160,6 +2160,9 @@ static const struct
+ 
+ #ifdef HALO_ANDROID
+ #define CONFIG_PLATFORM _platform_android
++#elif defined(HALO_TOUCH_SCREEN)
++/* (the 32-bit Android build: the desktop's settings and the touch controls') */
++#define CONFIG_PLATFORM (_platform_desktop | _platform_android)
+ #elif defined(HALO_XBOX_CONSOLE)
+ #define CONFIG_PLATFORM _platform_xbox
+ #elif defined(HALO_CONSOLE_GL_LAYER) && defined(_WIN32)
+@@ -4874,6 +4877,37 @@ static const struct config_value *config_value(const char *name, enum config_typ
+ 	static const struct config_value none = { 0, 0, 0.0, "" };
+ 	long index;
+ 
++	{ /* DEBUG: HALO_CONFIG_COUNT logs the names asked for most, each 50000 asks */
++		static int counting = -1;
++		static const char *names[64];
++		static unsigned long counts[64], total;
++
++		if (counting < 0)
++			counting = getenv("HALO_CONFIG_COUNT") != NULL;
++		if (counting)
++		{
++			unsigned long slot;
++
++			for (slot = 0; slot < 64 && names[slot] && names[slot] != name; slot++)
++			{
++			}
++			if (slot < 64)
++			{
++				names[slot] = name;
++				counts[slot]++;
++			}
++			if (++total % 50000 == 0)
++			{
++				for (slot = 0; slot < 64 && names[slot]; slot++)
++				{
++					if (counts[slot] > 500)
++						platform_log("config asks: %s %lu", names[slot], counts[slot]);
++					counts[slot] = 0;
++				}
++			}
++		}
++	}
++
+ 	pthread_mutex_lock(&config_lock);
+ 	if (!config_loaded)
+ 	{
 diff --git a/port/linux/src/sdl_platform.c b/port/linux/src/sdl_platform.c
-index 5c8b7f753..d6ea15444 100644
+index 5c8b7f753..dd099a55e 100644
 --- a/port/linux/src/sdl_platform.c
 +++ b/port/linux/src/sdl_platform.c
+@@ -554,7 +554,7 @@ BOOL platform_sdl_initialize(void)
+ 	Command-W does not quit) */
+ 	SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+ #endif
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 	/* landscape only; the back key arrives as a key event (xinput_sdl.c)
+ 	instead of closing the activity */
+ 	SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 @@ -1965,7 +1965,9 @@ BOOL platform_video_initialize(unsigned long width, unsigned long height)
  	host_renderer_vulkan = xgpu_vulkan;
  #endif
@@ -82,6 +156,33 @@ index 5c8b7f753..d6ea15444 100644
  #endif
  	if (!platform_gl_context)
  	{
+@@ -3391,7 +3406,7 @@ void platform_pump_events(void)
+ 			/* port: the held mouse let go while another window has the focus */
+ 			mouse_warp_release();
+ #endif
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 			touch_input_cancel();
+ #endif
+ 			break;
+@@ -3403,7 +3418,7 @@ void platform_pump_events(void)
+ 				platform_mouse_capture(TRUE);
+ #endif
+ 			break;
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 		case SDL_EVENT_FINGER_DOWN:
+ 		case SDL_EVENT_FINGER_MOTION:
+ 		case SDL_EVENT_FINGER_UP:
+@@ -3517,7 +3532,7 @@ int platform_binding_capture_poll(int *input)
+ 	return result;
+ }
+ 
+-#ifndef HALO_ANDROID
++#if !defined(HALO_ANDROID) && !defined(HALO_TOUCH_SCREEN)
+ /* ---------- the menus' pointer */
+ 
+ /* While a menu is up the mouse is released, its pointer shows (centered when
 diff --git a/port/linux/src/text_hires.c b/port/linux/src/text_hires.c
 index df894bf48..4c071b208 100644
 --- a/port/linux/src/text_hires.c
@@ -142,6 +243,81 @@ index df894bf48..4c071b208 100644
  	return atlas_texture;
  }
  
+diff --git a/port/linux/src/touch_input.c b/port/linux/src/touch_input.c
+index 4da56ca20..9b1178079 100644
+--- a/port/linux/src/touch_input.c
++++ b/port/linux/src/touch_input.c
+@@ -16,7 +16,7 @@ finger down (host_gesture_insets).
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ /* port/android/guest/runtime/guest_host.h */
+ void host_gesture_insets(int *insets);
+ void host_touch_read(int *state);
+@@ -86,7 +86,7 @@ static void menu_setup(void)
+ and zones matter only at a down, so changing them between two fingers is safe */
+ static void refresh_zones(int width, int height)
+ {
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 	int insets[4];
+ 
+ 	host_gesture_insets(insets);
+@@ -185,7 +185,7 @@ void touch_input_gamepad(XINPUT_GAMEPAD *pad)
+ 	}
+ }
+ 
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ /* ---------- the on-screen touch controls
+ 
+ The overlay (port/android/app/.../TouchControls.java) draws and reads its
+diff --git a/port/linux/src/touch_input.h b/port/linux/src/touch_input.h
+index e4df652ae..0de00b714 100644
+--- a/port/linux/src/touch_input.h
++++ b/port/linux/src/touch_input.h
+@@ -35,7 +35,7 @@ void touch_input_menu_read(struct platform_ui_pointer *pointer);
+ presses A for a few polls when a cinematic can be skipped */
+ void touch_input_gamepad(XINPUT_GAMEPAD *pad);
+ 
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ /* the on-screen touch controls (port/android/app/.../TouchControls.java),
+ an Android view over the game: tells them whether a menu is up and
+ input.touch_controls, and adds their stick and buttons to port 0's state */
+diff --git a/port/linux/src/xinput_sdl.c b/port/linux/src/xinput_sdl.c
+index 86bff183c..aa57b1df0 100644
+--- a/port/linux/src/xinput_sdl.c
++++ b/port/linux/src/xinput_sdl.c
+@@ -165,7 +165,7 @@ int halo_linux_mouse_look(short gamepad_index, float *yaw, float *pitch)
+ 	mouse_pending_y = 0.0f;
+ 	mouse_polls_unconsumed = 0;
+ 	pthread_mutex_unlock(&mouse_lock);
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 	/* the touch controls' swipe; it is not the mouse's aiming
+ 	(halo_linux_mouse_aiming), so a thumb keeps the stick's magnetism */
+ 	touch_input_look(scale, yaw, pitch);
+@@ -2529,7 +2529,7 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
+ 		}
+ 		test_input_gamepad(&state->Gamepad);
+ 		touch_input_gamepad(&state->Gamepad);
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 		touch_input_controls(&state->Gamepad, input.menus);
+ #endif
+ #ifdef HALO_GUIDE
+@@ -2589,7 +2589,7 @@ DWORD WINAPI XInputSetState(HANDLE device, PXINPUT_FEEDBACK feedback)
+ 	feedback->Header.dwStatus = ERROR_SUCCESS;
+ 	if (port < 0)
+ 		return ERROR_DEVICE_NOT_CONNECTED;
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 	/* the phone vibrates for the touch controls' player */
+ 	if (port == 0)
+ 		touch_input_rumble(feedback->Rumble.wLeftMotorSpeed, feedback->Rumble.wRightMotorSpeed);
 diff --git a/source/bitmaps/libtiff/tiffcompat.h b/source/bitmaps/libtiff/tiffcompat.h
 index d1a10aea3..84be3ea9f 100644
 --- a/source/bitmaps/libtiff/tiffcompat.h

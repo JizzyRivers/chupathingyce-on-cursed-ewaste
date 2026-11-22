@@ -56,3 +56,13 @@ int console_setup_update_question(const char *latest, const char *current)
 	(void)current;
 	return 0;
 }
+
+/* the test script's pointer events (xinput_sdl.c) act on the desktop's mouse pointer, which the touch
+build's menus do not have (sdl_platform.c's touch section): nothing to do */
+void platform_test_pointer_event(float x, float y, int button, int wheel)
+{
+	(void)x;
+	(void)y;
+	(void)button;
+	(void)wheel;
+}

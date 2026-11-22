@@ -176,6 +176,18 @@ __attribute__((visibility("default"))) int SDL_main(int argc, char *argv[])
 			setenv("HALO_DISPLAY_WIDTH", width, 1);
 			__android_log_print(ANDROID_LOG_INFO, LOG_TAG, "display %dx%d: rendering %sx480", mode->w, mode->h, width);
 		}
+		{
+			/* dp for the touch controls (port/linux/src/touch_input.c): SDL gives Android's densityDpi / 160 */
+			float density = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+			char text[16];
+
+			if (density > 0.0f)
+			{
+				snprintf(text, sizeof(text), "%g", density);
+				setenv("HALO_DISPLAY_DENSITY", text, 1);
+				__android_log_print(ANDROID_LOG_INFO, LOG_TAG, "display density %s", text);
+			}
+		}
 	}
 	__android_log_print(ANDROID_LOG_INFO, LOG_TAG, "data %s, saves %s", data_root, save_root);
 

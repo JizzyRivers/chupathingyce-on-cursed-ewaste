@@ -38,7 +38,9 @@ TRIPLE = f"armv7a-linux-androideabi{ANDROID_API}"
 # (-fPIC last: the 32-bit Linux flags have -fno-pic before the instruction set, and a shared library needs
 # every unit, the third-party ones too, position independent)
 INSTRUCTION_SET = ["-march=armv7-a", "-mfpu=neon-vfpv4", "-mfloat-abi=softfp", "-fPIC"]
-ABI_FLAGS = ["-fsigned-char", "-mno-implicit-float", "-fPIC", "-DHALO_ANDROID32", "-DHALO_GL_ES=1"]
+ABI_FLAGS = ["-fsigned-char", "-mno-implicit-float", "-fPIC", "-DHALO_ANDROID32", "-DHALO_GL_ES=1",
+              # the touch controls and the menus' touch pointer (port/linux/src/touch_input.c)
+              "-DHALO_TOUCH_SCREEN"]
 CAPABILITIES = [
     # config.toml in the data folder (HALO_DATA_ROOT, src/android32_main.c)
     "-DHALO_CONSOLE_CONFIG_IN_DATA_ROOT",
@@ -57,7 +59,7 @@ CAPABILITIES = [
 ]
 # (the entry point and the GL helpers talk to bionic and ES only, as posix_*.c do)
 NATIVE_SOURCES = ["src/android32_main.c", "src/android32_gl.c", "src/android32_steam.c",
-                  "src/android32_align.c"]
+                  "src/android32_align.c", "src/android32_touch.c"]
 PLATFORM_SOURCES = ["src/android32_setup.c"]
 LIBRARIES = ["SDL3", "GLESv3", "EGL", "log", "android", "m", "dl", "z"]
 
