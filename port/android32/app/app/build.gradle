@@ -8,7 +8,23 @@ plugins {
 def repository = new File(rootDir, "../../..")
 def staged = new File(repository, "build/android32/stage")
 def sdlJava = new File(repository, "build/android32/SDL3/android-project/app/src/main/java")
-def haloVersion = System.getenv("HALO_VERSION") ?: "0.9.1b-android32-dev"
+// the game's version (package.py gives it: the submodule's VERSION), as versionName; versionCode as
+// upstream makes it (major * 10000 + minor * 100 + patch: 0.9.1b is 901)
+def haloVersion = System.getenv("HALO_VERSION") ?: "0.9.1b-dev"
+def haloVersionCode = {
+    def found = (haloVersion =~ /^(\d+)\.(\d+)(?:\.(\d+))?/)
+    if (!found) throw new GradleException("the version ${haloVersion} does not start with major.minor.patch")
+    return Math.max(1, found[0][1].toInteger() * 10000 + found[0][2].toInteger() * 100 + (found[0][3] ?: "0").toInteger())
+}()
+
+// The release key: the properties file named by ANDROID32_KEYSTORE_PROPERTIES (storeFile, storePassword,
+// keyAlias, keyPassword), kept outside every repository (~/.chupathingyce-steamlink/android32-keystore.properties).
+// Without it the release build is left unsigned (never signed with a stand-in key).
+def keystore = new Properties()
+def keystorePath = System.getenv("ANDROID32_KEYSTORE_PROPERTIES")
+if (keystorePath && new File(keystorePath).exists())
+    new File(keystorePath).withInputStream { keystore.load(it) }
+def signed = keystore["storeFile"] != null
 
 android {
     namespace "dev.warman.chupathingyce32"
@@ -19,7 +35,7 @@ android {
         // 28: getrandom and the other calls bionic has from Pie
         minSdk 28
         targetSdk 34
-        versionCode 1
+        versionCode haloVersionCode
         versionName haloVersion
         ndk {
             abiFilters "armeabi-v7a"
@@ -30,6 +46,25 @@ android {
         main {
             java.srcDirs += sdlJava
             jniLibs.srcDirs = [new File(staged, "jniLibs")]
+        }
+    }
+
+    signingConfigs {
+        if (signed) {
+            release {
+                storeFile new File(keystore["storeFile"])
+                storePassword keystore["storePassword"]
+                keyAlias keystore["keyAlias"]
+                keyPassword keystore["keyPassword"]
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            // (the game is native code: nothing for R8 to shrink in the few Java classes)
+            minifyEnabled false
+            if (signed) signingConfig signingConfigs.release
         }
     }
 
