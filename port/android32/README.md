@@ -22,6 +22,9 @@ Tested: Amlogic S905W2 (Mali-G31, ES 3.2): Blood Gulch at about 40 fps; Echo Sho
    a button: copy one there (adb, a file manager) and press "check again". The whole set with the movies is
    2.4 GB. Or copy the maps by hand, which the screen also says:
    `adb push maps /sdcard/Android/data/dev.warman.chupathingyce32/files/`, then "check again".
+   Custom Edition's maps are optional: put Halo PC's installer (`halocesetup_en_1.00.exe`) in the same
+   folder and the next start reads it with the game's own importer into `maps_ce` (about a minute, a toast
+   says so; 418 MB).
 3. A gamepad works as on the desktop. A device with a touchscreen gets the
    on-screen controls (upstream's overlay; a compact layout on a small wide screen); a television
    does not. The first start makes the game's caches, which takes a while.
