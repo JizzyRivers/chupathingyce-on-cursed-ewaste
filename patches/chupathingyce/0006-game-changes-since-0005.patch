@@ -1,0 +1,1887 @@
+diff --git a/port/linux/game/lighting_config.c b/port/linux/game/lighting_config.c
+index 3471cf5f4..f97232140 100644
+--- a/port/linux/game/lighting_config.c
++++ b/port/linux/game/lighting_config.c
+@@ -9,6 +9,7 @@ chester's from GulchCE, where each was a setting of its own.
+ The level is read again only when a setting changes (config_changes): a light
+ or a draw asks for its parts many times a frame. */
+ #include "lighting_config.h"
++#include <stdlib.h>
+ #include <string.h>
+ 
+ int config_boolean(const char *name);
+@@ -79,7 +80,7 @@ int lighting_config_level(void)
+ 	return level;
+ }
+ 
+-int lighting_config_boolean(const char *name)
++static int lighting_config_lookup(const char *name)
+ {
+ 	int level = lighting_config_level();
+ 	unsigned int i;
+@@ -91,4 +92,40 @@ int lighting_config_boolean(const char *name)
+ 	}
+ 	return config_boolean(name);
+ }
++
++/* (the answers by the name's address, the callers' literals: a model's
++draw asks several times, each a dozen string compares and, for a name not
++a part's, a look in the settings under their lock; asked again when a
++setting changes. HALO_NO_LIGHTING_CONFIG_CACHE: every time) */
++#define LIGHTING_CONFIG_CACHE 32
++
++int lighting_config_boolean(const char *name)
++{
++	static struct
++	{
++		const char *name;
++		int value;
++	} cache[LIGHTING_CONFIG_CACHE];
++	static unsigned long cached_at = (unsigned long)-1;
++	static int software = -1, caching = -1;
++	unsigned long slot;
++
++	if (caching < 0)
++		caching = !getenv("HALO_NO_LIGHTING_CONFIG_CACHE");
++	if (!caching)
++		return lighting_config_lookup(name);
++	if (cached_at != config_changes() || software != xgpu_software_renderer * 2 + xgpu_weak_renderer)
++	{
++		memset(cache, 0, sizeof(cache));
++		cached_at = config_changes();
++		software = xgpu_software_renderer * 2 + xgpu_weak_renderer;
++	}
++	slot = ((unsigned long)(size_t)name >> 2) % LIGHTING_CONFIG_CACHE;
++	if (cache[slot].name != name)
++	{
++		cache[slot].value = lighting_config_lookup(name);
++		cache[slot].name = name;
++	}
++	return cache[slot].value;
++}
+ #endif
+diff --git a/port/linux/src/d3d8_gl.c b/port/linux/src/d3d8_gl.c
+index 7aed734c3..e56736d28 100644
+--- a/port/linux/src/d3d8_gl.c
++++ b/port/linux/src/d3d8_gl.c
+@@ -2014,6 +2014,13 @@ static BOOL bind_targets(BOOL *has_depth)
+ /* ---------- device creation */
+ 
+ static void program_adopt(GLuint vertex_shader, GLuint fragment_shader, GLuint program);
++#ifdef HALO_CONSOLE_GLES2
++static void sort_flush(void);
++static GLuint sort_program_of(unsigned long key);
++static void sort_learn(unsigned long key, GLuint program);
++static void merge_flush(void);
++static BOOL merge_keep(D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices);
++#endif
+ 
+ /* The visibility tests' query objects (lens flares, light glows: the game's
+ rasterizer_lights.c). Desktop OpenGL 4.5 creates them typed and at once
+@@ -2820,6 +2827,9 @@ static BOOL trace_frame(void);
+ 
+ void WINAPI D3DDevice_SetRenderTarget(D3DSurface *render_target, D3DSurface *depth_stencil)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	sort_flush();
++#endif
+ 	if (trace_frame())
+ 		platform_log("set render target %08lx depth %08lx", render_target ? (unsigned long)render_target->Data : 0,
+ 			depth_stencil ? (unsigned long)depth_stencil->Data : 0);
+@@ -2846,6 +2856,9 @@ void WINAPI D3DDevice_SetRenderTarget(D3DSurface *render_target, D3DSurface *dep
+ 
+ void WINAPI D3DDevice_SetViewport(CONST D3DVIEWPORT8 *viewport)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	sort_flush();
++#endif
+ 	device.viewport = *viewport;
+ 	viewport_update_constants();
+ }
+@@ -2867,6 +2880,9 @@ void WINAPI D3DDevice_SetSoftDisplayFilter(BOOL enable) { (void)enable; }
+ 
+ void WINAPI D3DDevice_SetShaderConstantMode(D3DSHADERCONSTANTMODE mode)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	sort_flush();
++#endif
+ 	device.shader_constant_mode = mode;
+ 	viewport_update_constants();
+ }
+@@ -2896,6 +2912,9 @@ void WINAPI D3DDevice_InsertCallback(D3DCALLBACKTYPE type, D3DCALLBACK callback,
+ 
+ void WINAPI D3DDevice_BeginVisibilityTest(void)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	sort_flush();
++#endif
+ #ifdef HALO_BGFX
+ 	if (bg_active())
+ 	{
+@@ -4739,6 +4758,7 @@ static struct
+ } fuse;
+ 
+ static void draw_indexed_vertices_untimed(D3DPRIMITIVETYPE primitive_type, UINT vertex_count, CONST WORD *index_data);
++static BOOL fuse_defer(D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices);
+ 
+ static void fuse_state_keep(struct fuse_state *state, D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices)
+ {
+@@ -5181,6 +5201,481 @@ void d3d8_gl_fuse_end(void)
+ 	fuse.capturing = fuse.texturing = FALSE;
+ 	fuse.count = fuse.next = 0;
+ }
++
++/* A pass's fused draws in the order of their programs. The level's parts
++come in the order of their lightmaps and materials, and the driver's cost
++of a draw is mostly that of a change of program (0.25 to 0.3 ms, against
++under 0.1 for a draw with the program of the one before). They are opaque
++and depth tested, so their order does not show: between
++d3d8_gl_fuse_pass(1) and (0) they are kept whole, and drawn at the end
++with those of a program together. HALO_GLES2_NO_FUSE_SORT: as they come. */
++#define FUSE_DEFERRED 256
++
++struct fuse_deferred
++{
++	struct fuse_state a, b;
++	unsigned long key, order, group;
++	int alpha;
++};
++
++static struct
++{
++	int on;
++	unsigned long count;
++	struct fuse_deferred *draws;
++	unsigned short sorted[FUSE_DEFERRED];
++} fuse_pass;
++
++static unsigned long fuse_state_key(const struct fuse_state *state)
++{
++	struct nv2a_pixel_shader_key key;
++
++	memset(&key, 0, sizeof(key));
++	memcpy(key.combiner_state, state->render_state, sizeof(key.combiner_state));
++	memset(&key.combiner_state[D3DRS_PSCONSTANT0_0], 0, 16 * sizeof(DWORD));
++	key.combiner_state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0;
++	key.combiner_state[D3DRS_PSFINALCOMBINERCONSTANT1] = 0;
++	return hash_words(key.combiner_state, sizeof(key.combiner_state)) ^
++		((unsigned long)(uintptr_t)state->program_slots[state->program_address] * 2654435761UL) ^
++		(state->render_state[D3DRS_ALPHATESTENABLE] ? 0x9e3779b9UL : 0);
++}
++
++static int fuse_deferred_compare(const void *a, const void *b)
++{
++	const struct fuse_deferred *first = &fuse_pass.draws[*(const unsigned short *)a];
++	const struct fuse_deferred *second = &fuse_pass.draws[*(const unsigned short *)b];
++
++	if (first->group != second->group)
++		return first->group < second->group ? -1 : 1;
++	if (first->key != second->key)
++		return first->key < second->key ? -1 : 1;
++	return first->order < second->order ? -1 : first->order > second->order;
++}
++
++/* B's draw kept with its A for the pass's end; FALSE to draw it now */
++static BOOL fuse_defer(D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices)
++{
++	struct fuse_deferred *draw;
++
++	if (!fuse_pass.on || fuse.next >= fuse.count || fuse_pass.count == FUSE_DEFERRED)
++		return FALSE;
++	if (!fuse_pass.draws && !(fuse_pass.draws = malloc(FUSE_DEFERRED * sizeof(*fuse_pass.draws))))
++		return FALSE;
++	draw = &fuse_pass.draws[fuse_pass.count];
++	draw->a = fuse.captures[fuse.next++];
++	fuse_state_keep(&draw->b, type, count, indices);
++	draw->alpha = fuse.alpha;
++	draw->order = fuse_pass.count;
++	draw->key = fuse_state_key(&draw->a) * 31 + fuse_state_key(&draw->b);
++	fuse_pass.sorted[fuse_pass.count] = (unsigned short)fuse_pass.count;
++	fuse_pass.count++;
++	return TRUE;
++}
++
++void d3d8_gl_fuse_pass(int begin)
++{
++	static int sorting = -1, grouping = -1;
++	static struct fuse_state last;
++	unsigned long index;
++
++	if (sorting < 0)
++		sorting = !getenv("HALO_GLES2_NO_FUSE_SORT");
++	if (begin)
++	{
++		fuse_pass.on = sorting;
++		fuse_pass.count = 0;
++		return;
++	}
++	fuse_pass.on = FALSE;
++	if (!fuse_pass.count)
++		return;
++	/* (the device as the game left it, for after) */
++	fuse_state_keep(&last, 0, 0, NULL);
++	/* (keys whose draws were drawn with one program last time together, as
++	that program's: different combiner states can make one program.
++	HALO_GLES2_NO_FUSE_GROUP: by key alone) */
++	if (grouping < 0)
++		grouping = !getenv("HALO_GLES2_NO_FUSE_GROUP");
++	for (index = 0; index < fuse_pass.count; index++)
++	{
++		struct fuse_deferred *draw = &fuse_pass.draws[index];
++		GLuint program = grouping ? sort_program_of(draw->key) : 0;
++
++		draw->group = program ? program : 0x80000000UL | (draw->key >> 1);
++	}
++	qsort(fuse_pass.sorted, fuse_pass.count, sizeof(fuse_pass.sorted[0]), fuse_deferred_compare);
++	for (index = 0; index < fuse_pass.count; index++)
++	{
++		struct fuse_deferred *draw = &fuse_pass.draws[fuse_pass.sorted[index]];
++
++		fuse.captures[0] = draw->a;
++		fuse.count = 1;
++		fuse.next = 0;
++		fuse.alpha = draw->alpha;
++		fuse_state_apply(&draw->b);
++		fuse_draw(draw->b.type, draw->b.count, draw->b.indices);
++		sort_learn(draw->key, gl_state.program);
++	}
++	fuse.count = fuse.next = 0;
++	fuse_pass.count = 0;
++	fuse_state_apply(&last);
++}
++#endif
++
++#ifdef HALO_CONSOLE_GLES2
++/* ---------- a pass's opaque draws in the order of their programs (sorted)
++
++The driver's cost of a draw is mostly that of a change of program (0.2 to
++0.45 ms, against under 0.1 for a draw with the program of the one before),
++and the objects' draws come object by object: damnation's ten of one model
++are two parts each, of two programs (a skinned and a one-node vertex
++shader), twenty changes where two would draw the same. Between
++d3d8_gl_sort_pass(1) and (0) (render.c, around render_objects, in
++performance mode) a draw that writes depth over a depth test of LESS or
++LESSEQUAL, unblended, and that writes no stencil, is kept whole with the
++device's state, and drawn later with the others of its program together:
++each program's in the order they came, the programs in the order they
++first came. Any other draw, a clear, a change of
++target or a visibility test draws the kept ones first. Their order can only
++show where two of them are at the same depth; and the Xbox's GPU drew a
++frame's draws well after the game made them, so what they read stays as it
++was. HALO_GLES2_NO_SORT: as they come. */
++#define SORT_DRAWS 128
++#define SORT_KNOWN 256
++
++struct sort_draw
++{
++	DWORD render_state[D3DRS_MAX];
++	DWORD texture_state[D3DTSS_MAXSTAGES][D3DTSS_MAX];
++	D3DBaseTexture *textures[D3DTSS_MAXSTAGES];
++	D3DPalette *palettes[D3DTSS_MAXSTAGES];
++	struct vertex_shader_object *vertex_shader;
++	struct vertex_shader_object *program_slots[VERTEX_PROGRAM_SLOTS];
++	unsigned long program_address;
++	D3DSHADERCONSTANTMODE shader_constant_mode;
++	float constants[XGPU_VERTEX_CONSTANT_COUNT][4];
++	D3DVIEWPORT8 viewport;
++	float viewport_scale[4], viewport_offset[4];
++	float attributes[XGPU_VERTEX_ATTRIBUTE_COUNT][4];
++	unsigned char streams[sizeof(((struct gl_device *)0)->streams)];
++	UINT base_vertex_index;
++	WORD *index_data;
++	int mcc;
++	D3DPRIMITIVETYPE type;
++	UINT count;
++	CONST WORD *indices;
++	unsigned long key;
++	unsigned long group, order;
++};
++
++static struct
++{
++	int on, replaying;
++	unsigned long count;
++	struct sort_draw *draws, last;
++	unsigned short sorted[SORT_DRAWS];
++	/* the program each key's draws were last drawn with: keys that differ
++	where the program does not are drawn together */
++	struct
++	{
++		unsigned long key;
++		GLuint program;
++	} known[SORT_KNOWN];
++	unsigned long kept, apart, flushes, frame;
++} sort;
++
++static GLuint sort_program_of(unsigned long key)
++{
++	unsigned long slot = key % SORT_KNOWN;
++
++	return sort.known[slot].key == key ? sort.known[slot].program : 0;
++}
++
++static void sort_learn(unsigned long key, GLuint program)
++{
++	unsigned long slot = key % SORT_KNOWN;
++
++	sort.known[slot].key = key;
++	sort.known[slot].program = program;
++}
++
++static void sort_state_keep(struct sort_draw *state, D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices)
++{
++	memcpy(state->render_state, D3D__RenderState, sizeof(state->render_state));
++	memcpy(state->texture_state, D3D__TextureState, sizeof(state->texture_state));
++	memcpy(state->textures, device.textures, sizeof(state->textures));
++	memcpy(state->palettes, device.palettes, sizeof(state->palettes));
++	state->vertex_shader = device.vertex_shader;
++	memcpy(state->program_slots, device.program_slots, sizeof(state->program_slots));
++	state->program_address = device.program_address;
++	state->shader_constant_mode = device.shader_constant_mode;
++	memcpy(state->constants, device.constants, sizeof(state->constants));
++	state->viewport = device.viewport;
++	memcpy(state->viewport_scale, device.viewport_scale, sizeof(state->viewport_scale));
++	memcpy(state->viewport_offset, device.viewport_offset, sizeof(state->viewport_offset));
++	memcpy(state->attributes, device.attributes, sizeof(state->attributes));
++	memcpy(state->streams, device.streams, sizeof(state->streams));
++	state->base_vertex_index = device.base_vertex_index;
++	state->index_data = D3D__IndexData;
++	state->mcc = mcc_environment_shader_active();
++	state->type = type;
++	state->count = count;
++	state->indices = indices;
++}
++
++static void sort_state_apply(const struct sort_draw *state)
++{
++	memcpy(D3D__RenderState, state->render_state, sizeof(state->render_state));
++	memcpy(D3D__TextureState, state->texture_state, sizeof(state->texture_state));
++	memcpy(device.textures, state->textures, sizeof(state->textures));
++	memcpy(device.palettes, state->palettes, sizeof(state->palettes));
++	device.vertex_shader = state->vertex_shader;
++	memcpy(device.program_slots, state->program_slots, sizeof(state->program_slots));
++	device.program_address = state->program_address;
++	device.shader_constant_mode = state->shader_constant_mode;
++	/* (only the registers that differ are marked changed) */
++	constants_store(0, state->constants, XGPU_VERTEX_CONSTANT_COUNT);
++	device.viewport = state->viewport;
++	memcpy(device.viewport_scale, state->viewport_scale, sizeof(state->viewport_scale));
++	memcpy(device.viewport_offset, state->viewport_offset, sizeof(state->viewport_offset));
++	memcpy(device.attributes, state->attributes, sizeof(state->attributes));
++	memcpy(device.streams, state->streams, sizeof(state->streams));
++	device.base_vertex_index = state->base_vertex_index;
++	D3D__IndexData = state->index_data;
++	mcc_environment_shader_set(state->mcc);
++}
++
++/* what a draw's program is made of, as far as the device's state says
++(the program it was drawn with is learned: sort_learn) */
++static unsigned long sort_state_key(void)
++{
++	DWORD combiner[sizeof(((struct nv2a_pixel_shader_key *)0)->combiner_state) / sizeof(DWORD)];
++	unsigned long key;
++	int stage;
++
++	memcpy(combiner, D3D__RenderState, sizeof(combiner));
++	memset(&combiner[D3DRS_PSCONSTANT0_0], 0, 16 * sizeof(DWORD));
++	combiner[D3DRS_PSFINALCOMBINERCONSTANT0] = 0;
++	combiner[D3DRS_PSFINALCOMBINERCONSTANT1] = 0;
++	key = hash_words(combiner, sizeof(combiner));
++	key ^= (unsigned long)(uintptr_t)current_program() * 2654435761UL;
++	key = key * 31 + D3D__RenderState[D3DRS_PSTEXTUREMODES];
++	key = key * 31 + (D3D__RenderState[D3DRS_ALPHATESTENABLE] ? D3D__RenderState[D3DRS_ALPHAFUNC] : 0);
++	key = key * 31 + (D3D__RenderState[D3DRS_FOGENABLE] ? 1 + D3D__RenderState[D3DRS_FOGTABLEMODE] : 0);
++	key = key * 31 + (unsigned long)mcc_environment_shader_active();
++	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
++	{
++		key = key * 31 + (device.textures[stage] ? 1 : 0);
++		key = key * 31 + D3D__TextureState[stage][D3DTSS_ALPHAKILL];
++		key = key * 31 + D3D__TextureState[stage][D3DTSS_COLORSIGN];
++	}
++	return key;
++}
++
++/* whether a draw's order among the others kept cannot show */
++static BOOL sort_draw_fits(void)
++{
++	const DWORD *state = D3D__RenderState;
++	struct vertex_shader_object *program = current_program();
++
++	/* (the Light effects' lights are the game's for the draw's object: none
++	on a console) */
++	if (!program || (program->plasma_model && plasma_model_lighting_mask()) || device.visibility_test_active ||
++		device.immediate_active)
++		return FALSE;
++	if (state[D3DRS_ALPHABLENDENABLE] || !state[D3DRS_ZENABLE] || !state[D3DRS_ZWRITEENABLE] ||
++		(state[D3DRS_ZFUNC] != D3DCMP_LESSEQUAL && state[D3DRS_ZFUNC] != D3DCMP_LESS))
++	{
++		return FALSE;
++	}
++	/* (a stencil tested but not written, as the objects' is, EQUAL 0: the
++	same for all of them, as none of those kept writes it; a draw that writes
++	it draws the kept ones first) */
++	if (state[D3DRS_STENCILENABLE] && (state[D3DRS_STENCILWRITEMASK] & 0xff) &&
++		(state[D3DRS_STENCILFAIL] != D3DSTENCILOP_KEEP || state[D3DRS_STENCILZFAIL] != D3DSTENCILOP_KEEP ||
++			state[D3DRS_STENCILPASS] != D3DSTENCILOP_KEEP))
++	{
++		return FALSE;
++	}
++	return TRUE;
++}
++
++static int sort_draw_compare(const void *a, const void *b)
++{
++	const struct sort_draw *first = &sort.draws[*(const unsigned short *)a];
++	const struct sort_draw *second = &sort.draws[*(const unsigned short *)b];
++
++	if (first->group != second->group)
++		return first->group < second->group ? -1 : 1;
++	return first->order < second->order ? -1 : first->order > second->order;
++}
++
++/* the kept draws drawn, sorted, and the device as the game has it after */
++static void sort_flush(void)
++{
++	unsigned long index, other;
++
++	merge_flush();
++	if (!sort.count || sort.replaying)
++		return;
++	sort.flushes++;
++	sort_state_keep(&sort.last, 0, 0, NULL);
++	/* each draw's group: the first of the draws of its program (by the
++	program its key was drawn with last, else by its key) */
++	for (index = 0; index < sort.count; index++)
++	{
++		struct sort_draw *draw = &sort.draws[index];
++		GLuint program = sort_program_of(draw->key);
++
++		draw->group = index;
++		for (other = 0; other < index; other++)
++		{
++			const struct sort_draw *earlier = &sort.draws[other];
++
++			if (earlier->key == draw->key || (program && sort_program_of(earlier->key) == program))
++			{
++				draw->group = earlier->group;
++				break;
++			}
++		}
++		sort.sorted[index] = (unsigned short)index;
++	}
++	qsort(sort.sorted, sort.count, sizeof(sort.sorted[0]), sort_draw_compare);
++	sort.replaying = TRUE;
++	for (index = 0; index < sort.count; index++)
++	{
++		struct sort_draw *draw = &sort.draws[sort.sorted[index]];
++
++		sort_state_apply(draw);
++		draw_indexed_vertices_untimed(draw->type, draw->count, draw->indices);
++		sort_learn(draw->key, gl_state.program);
++	}
++	sort.replaying = FALSE;
++	sort.count = 0;
++	sort_state_apply(&sort.last);
++}
++
++/* an indexed draw kept for later: FALSE to draw it now (after the kept
++ones, where it is not one to keep) */
++static BOOL sort_keep(D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices)
++{
++	struct sort_draw *draw;
++
++	if (!sort.on || sort.replaying)
++		return FALSE;
++	if (!sort_draw_fits())
++	{
++		static int told; /* DEBUG */
++
++		if (told < 40 && getenv("HALO_D3D_WHO"))
++		{
++			told++;
++			platform_log("SORT apart: blend %lu z %lu/%lu func %lu stencil %lu func %lu ops %lu/%lu/%lu write %lx ref %lu vs %lu",
++				(unsigned long)D3D__RenderState[D3DRS_ALPHABLENDENABLE], (unsigned long)D3D__RenderState[D3DRS_ZENABLE],
++				(unsigned long)D3D__RenderState[D3DRS_ZWRITEENABLE], (unsigned long)D3D__RenderState[D3DRS_ZFUNC],
++				(unsigned long)D3D__RenderState[D3DRS_STENCILENABLE], (unsigned long)D3D__RenderState[D3DRS_STENCILFUNC],
++				(unsigned long)D3D__RenderState[D3DRS_STENCILFAIL], (unsigned long)D3D__RenderState[D3DRS_STENCILZFAIL],
++				(unsigned long)D3D__RenderState[D3DRS_STENCILPASS], (unsigned long)D3D__RenderState[D3DRS_STENCILWRITEMASK],
++				(unsigned long)D3D__RenderState[D3DRS_STENCILREF], current_program() ? current_program()->id : 0);
++		}
++		sort.apart++;
++		sort_flush();
++		return FALSE;
++	}
++	if (sort.count == SORT_DRAWS)
++		sort_flush();
++	if (!sort.draws && !(sort.draws = malloc(SORT_DRAWS * sizeof(*sort.draws))))
++		return FALSE;
++	draw = &sort.draws[sort.count];
++	sort_state_keep(draw, type, count, indices);
++	draw->key = sort_state_key();
++	draw->order = sort.count;
++	sort.count++;
++	sort.kept++;
++	return TRUE;
++}
++
++/* (HALO_GLES2_SORT_FLIP=n, for pictures: TRUE in the frames the changes
++are off, every other n; for the game's side of them too) */
++int d3d8_gl_flipped_off(void)
++{
++	static long flip = -1;
++
++	if (flip < 0)
++		flip = getenv("HALO_GLES2_SORT_FLIP") ? atol(getenv("HALO_GLES2_SORT_FLIP")) : 0;
++	return flip > 0 && (device.frame / (unsigned long)flip) % 2;
++}
++
++void d3d8_gl_sort_pass(int begin)
++{
++	static int allowed = -1;
++	static long flip = -1;
++
++	if (allowed < 0)
++	{
++		allowed = !getenv("HALO_GLES2_NO_SORT");
++		/* (HALO_GLES2_SORT_FLIP=n, for pictures: off every other n frames) */
++		flip = getenv("HALO_GLES2_SORT_FLIP") ? atol(getenv("HALO_GLES2_SORT_FLIP")) : 0;
++	}
++	sort_flush();
++	sort.on = begin && allowed && !(flip > 0 && (device.frame / (unsigned long)flip) % 2);
++	if (!begin && ++sort.frame % 600 == 0)
++	{
++		platform_log("GPU: sorted passes: %lu draws kept and %lu apart a frame, %lu flushes", sort.kept / 600,
++			sort.apart / 600, sort.flushes / 600);
++		sort.kept = sort.apart = sort.flushes = 0;
++	}
++}
++#endif
++
++#ifdef HALO_CONSOLE_GLES2
++static void *draw_caller; /* DEBUG: the game's call of the draw (draw_who) */
++/* DEBUG: HALO_D3D_WHO logs each (program, caller) pair's first draw, the
++game code that issues it, for telling which pass a GL program is */
++static void draw_who(GLuint gl_program, const struct vertex_shader_object *program, BOOL immediate)
++{
++	static int on = -1;
++	static unsigned long seen[512][3], seen_count;
++	int index;
++	unsigned long caller;
++
++	static long sequence = -2;
++
++	if (sequence == -2)
++		sequence = getenv("HALO_D3D_SEQ") ? atol(getenv("HALO_D3D_SEQ")) : -1;
++	/* (HALO_D3D_SEQ=frame: that frame's draws, each a line) */
++	if (sequence >= 0 && device.frame >= (unsigned long)sequence && device.frame < (unsigned long)sequence + 2)
++	{
++		platform_log("SEQ %lu program %u vs %lu imm %d blend %lu z %lu/%lu src %lu dst %lu at %lx", device.frame, gl_program,
++			program->id, (int)immediate, (unsigned long)D3D__RenderState[D3DRS_ALPHABLENDENABLE],
++			(unsigned long)D3D__RenderState[D3DRS_ZENABLE], (unsigned long)D3D__RenderState[D3DRS_ZWRITEENABLE],
++			(unsigned long)D3D__RenderState[D3DRS_SRCBLEND], (unsigned long)D3D__RenderState[D3DRS_DESTBLEND],
++			(unsigned long)draw_caller);
++	}
++	if (on < 0)
++		on = getenv("HALO_D3D_WHO") != NULL;
++	if (!on || seen_count >= 512)
++		return;
++	caller = (unsigned long)draw_caller;
++	for (index = 0; index < (int)seen_count; index++)
++	{
++		if (seen[index][0] == gl_program && seen[index][1] == caller)
++			return;
++	}
++	seen[seen_count][0] = gl_program;
++	seen[seen_count][1] = caller;
++	seen_count++;
++	{
++		char line[300];
++		size_t n = 0;
++
++		n += (size_t)snprintf(line + n, sizeof(line) - n, "WHO program %u vs %lu imm %d fuse %d blend %lu z %lu/%lu cw %lx stencil %lu at %lx",
++			gl_program, program->id, (int)immediate, (int)fuse.active, (unsigned long)D3D__RenderState[D3DRS_ALPHABLENDENABLE],
++			(unsigned long)D3D__RenderState[D3DRS_ZENABLE], (unsigned long)D3D__RenderState[D3DRS_ZWRITEENABLE],
++			(unsigned long)D3D__RenderState[D3DRS_COLORWRITEENABLE], (unsigned long)D3D__RenderState[D3DRS_STENCILENABLE], caller);
++		platform_log("%s", line);
++	}
++}
+ #endif
+ 
+ static struct program_entry *prepare_draw(BOOL immediate)
+@@ -5338,6 +5833,7 @@ static struct program_entry *prepare_draw(BOOL immediate)
+ 	draw_flush();
+ 	state_program(entry->program);
+ #ifdef HALO_CONSOLE_GLES2
++	draw_who(entry->program, program, immediate);
+ 	if (fuse.active)
+ 		fuse_uniforms();
+ #endif
+@@ -6262,6 +6758,24 @@ static GLenum primitive_mode(D3DPRIMITIVETYPE type)
+ }
+ 
+ /* quads become two triangles each */
++/* room for count indices, the same each draw (grown as needed) */
++static WORD *rebase_buffer(unsigned long count)
++{
++	static WORD *buffer;
++	static unsigned long capacity;
++
++	if (count + 1 > capacity)
++	{
++		WORD *grown = realloc(buffer, (count + 1024) * sizeof(WORD));
++
++		if (!grown)
++			return NULL;
++		buffer = grown;
++		capacity = count + 1024;
++	}
++	return buffer;
++}
++
+ static WORD *quad_indices(const WORD *indices, unsigned long count, unsigned long *out_count)
+ {
+ 	unsigned long quads = count / 4;
+@@ -6302,6 +6816,9 @@ void WINAPI D3DDevice_SetIndices(D3DIndexBuffer *index_data, UINT base_vertex_in
+ 
+ static void draw_vertices_untimed(D3DPRIMITIVETYPE primitive_type, UINT start_vertex, UINT vertex_count)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	sort_flush();
++#endif
+ #ifdef HALO_BGFX
+ 	if (bg_active())
+ 	{
+@@ -6345,6 +6862,9 @@ static void draw_vertices_untimed(D3DPRIMITIVETYPE primitive_type, UINT start_ve
+ 
+ void WINAPI D3DDevice_DrawVertices(D3DPRIMITIVETYPE primitive_type, UINT start_vertex, UINT vertex_count)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	draw_caller = __builtin_return_address(0); /* DEBUG */
++#endif
+ 	RENDER_TIME_BEGIN();
+ 	draw_vertices_untimed(primitive_type, start_vertex, vertex_count);
+ 	RENDER_TIME_END();
+@@ -6389,9 +6909,16 @@ static void draw_indexed_vertices_untimed(D3DPRIMITIVETYPE primitive_type, UINT
+ 		}
+ 		if (fuse.texturing)
+ 		{
+-			fuse_draw(primitive_type, vertex_count, index_data);
++			if (!fuse_defer(primitive_type, vertex_count, index_data))
++				fuse_draw(primitive_type, vertex_count, index_data);
+ 			return;
+ 		}
++		/* (sorted: d3d8_gl_sort_pass) */
++		if (sort_keep(primitive_type, vertex_count, index_data))
++			return;
++		/* (merged: d3d8_gl_merge_pass) */
++		if (merge_keep(primitive_type, vertex_count, index_data))
++			return;
+ 	}
+ #endif
+ 	if (!vertex_count || !index_data || !prepare_draw(FALSE))
+@@ -6442,14 +6969,19 @@ static void draw_indexed_vertices_untimed(D3DPRIMITIVETYPE primitive_type, UINT
+ #ifdef HALO_GL_ES
+ 	if (!xgpu_capabilities.base_vertex)
+ 	{
+-		/* the indices are copied anyway: rebase them */
+-		WORD *rebased = malloc(count * sizeof(WORD) + 2);
++		/* the indices are copied anyway: rebase them (into a buffer kept
++		from draw to draw: index_upload copies them) */
++		WORD *rebased = rebase_buffer(count);
+ 
++		if (!rebased)
++		{
++			free(indices);
++			return;
++		}
+ 		for (index = 0; index < count; index++)
+ 			rebased[index] = (WORD)(source[index] - minimum);
+ 		glDrawElements(primitive_mode(primitive_type), (GLsizei)count, GL_UNSIGNED_SHORT,
+ 			(const void *)(uintptr_t)index_upload(rebased, count * sizeof(WORD)));
+-		free(rebased);
+ 		free(indices);
+ 		return;
+ 	}
+@@ -6460,8 +6992,207 @@ static void draw_indexed_vertices_untimed(D3DPRIMITIVETYPE primitive_type, UINT
+ 	free(indices);
+ }
+ 
++#ifdef HALO_CONSOLE_GLES2
++/* ---------- a pass's draws of one state as one draw (merged)
++
++The level's fog pass is a draw for each of the level's materials in view (20
++to 29 on damnation, wizard and boardingaction), each with the state of the
++one before but for where its vertices start and its indices: about 0.08 ms
++of the driver's each. Between d3d8_gl_merge_pass(1) and (0) (render.c,
++around structure_render_fog, in performance mode) a triangle list's draw
++whose state is the one before's whole (render and texture states, textures,
++shaders, every constant), and whose vertices are at a whole number of
++vertices from the first's in every stream it reads, is added to that one:
++its indices moved by that number. The run is drawn as one draw when the
++state changes, at a draw of another kind, a clear, a change of target and
++at the pass's end, its triangles in the order they came. HALO_GLES2_NO_MERGE:
++as they come. */
++#define MERGE_INDICES 32768
++
++static struct
++{
++	int on;
++	/* the run's first draw (its state the run's), and the run's indices,
++	as the first draw's vertices count them */
++	struct sort_draw first;
++	int pending;
++	unsigned long draws;
++	WORD *indices;
++	unsigned long count;
++	unsigned long merged, runs, frame;
++} merge;
++
++/* the vertices draw b's stream starts at past draw a's, in every stream
++the vertex shader reads (FALSE where they are not a whole number of them,
++or not the same in all) */
++static BOOL merge_offset(const struct sort_draw *a, long *offset)
++{
++	const struct vertex_shader_object *declaration = device.vertex_shader;
++	const struct { DWORD data; UINT stride; } *streams_a = (const void *)a->streams;
++	unsigned long index;
++	BOOL found = FALSE;
++
++	if (!declaration || declaration != a->vertex_shader)
++		return FALSE;
++	for (index = 0; index < declaration->element_count; index++)
++	{
++		const struct vertex_element *element = &declaration->elements[index];
++		unsigned long stream = element->stream;
++		long stride = (long)device.streams[stream].stride, bytes, vertices;
++
++		if (element->type == D3DVSDT_NONE || !device.streams[stream].data)
++			continue;
++		if (!streams_a[stream].data || (long)streams_a[stream].stride != stride || stride <= 0)
++			return FALSE;
++		bytes = (long)(device.streams[stream].data - streams_a[stream].data) +
++			((long)device.base_vertex_index - (long)a->base_vertex_index) * stride;
++		if (bytes % stride)
++			return FALSE;
++		vertices = bytes / stride;
++		if (found && vertices != *offset)
++			return FALSE;
++		*offset = vertices;
++		found = TRUE;
++	}
++	return found;
++}
++
++/* whether the device's state is the run's, streams aside */
++static BOOL merge_state_same(const struct sort_draw *a)
++{
++	return !memcmp(a->render_state, D3D__RenderState, sizeof(a->render_state)) &&
++		!memcmp(a->texture_state, D3D__TextureState, sizeof(a->texture_state)) &&
++		!memcmp(a->textures, device.textures, sizeof(a->textures)) &&
++		!memcmp(a->palettes, device.palettes, sizeof(a->palettes)) &&
++		a->vertex_shader == device.vertex_shader &&
++		!memcmp(a->program_slots, device.program_slots, sizeof(a->program_slots)) &&
++		a->program_address == device.program_address && a->shader_constant_mode == device.shader_constant_mode &&
++		!memcmp(&a->viewport, &device.viewport, sizeof(a->viewport)) &&
++		!memcmp(a->attributes, device.attributes, sizeof(a->attributes)) &&
++		a->mcc == mcc_environment_shader_active() &&
++		!memcmp(a->constants, device.constants, sizeof(a->constants));
++}
++
++/* the run's indices drawn as one draw, in the run's state (as a draw from
++indices of the process's own, draw_indexed_vertices_untimed's) */
++static void merge_draw_run(void)
++{
++	unsigned long minimum = 0xffff, maximum = 0, index;
++	WORD *rebased;
++
++	if (!prepare_draw(FALSE))
++		return;
++	for (index = 0; index < merge.count; index++)
++	{
++		if (merge.indices[index] < minimum)
++			minimum = merge.indices[index];
++		if (merge.indices[index] > maximum)
++			maximum = merge.indices[index];
++	}
++	if (minimum > maximum)
++		return;
++	setup_streams(device.base_vertex_index + minimum, maximum - minimum + 1);
++	rebased = rebase_buffer(merge.count);
++	if (!rebased)
++		return;
++	for (index = 0; index < merge.count; index++)
++		rebased[index] = (WORD)(merge.indices[index] - minimum);
++	stats.streamed_bytes += merge.count * sizeof(WORD);
++	glDrawElements(GL_TRIANGLES, (GLsizei)merge.count, GL_UNSIGNED_SHORT,
++		(const void *)(uintptr_t)index_upload(rebased, merge.count * sizeof(WORD)));
++}
++
++static void merge_flush(void)
++{
++	if (!merge.pending)
++		return;
++	merge.pending = FALSE;
++	sort.replaying = TRUE;
++	sort_state_keep(&sort.last, 0, 0, NULL);
++	sort_state_apply(&merge.first);
++	if (merge.draws == 1)
++		draw_indexed_vertices_untimed(merge.first.type, merge.first.count, merge.first.indices);
++	else
++	{
++		merge_draw_run();
++		merge.merged += merge.draws - 1;
++		merge.runs++;
++	}
++	sort_state_apply(&sort.last);
++	sort.replaying = FALSE;
++}
++
++/* an indexed draw added to the run, or begun as one: FALSE to draw it now
++(after the run) */
++static BOOL merge_keep(D3DPRIMITIVETYPE type, UINT count, CONST WORD *indices)
++{
++	long offset = 0;
++	UINT index;
++
++	if (!merge.on || sort.replaying)
++		return FALSE;
++	if (type != D3DPT_TRIANGLELIST || count > MERGE_INDICES || device.visibility_test_active ||
++		device.immediate_active || !current_program() ||
++		(current_program()->plasma_model && plasma_model_lighting_mask()))
++	{
++		merge_flush();
++		return FALSE;
++	}
++	if (!merge.indices && !(merge.indices = malloc(MERGE_INDICES * sizeof(WORD))))
++		return FALSE;
++	if (merge.pending && merge.count + count <= MERGE_INDICES && merge_state_same(&merge.first) &&
++		merge_offset(&merge.first, &offset))
++	{
++		for (index = 0; index < count; index++)
++		{
++			long moved = (long)indices[index] + offset;
++
++			if (moved < 0 || moved > 0xffff)
++				break;
++		}
++		if (index == count)
++		{
++			for (index = 0; index < count; index++)
++				merge.indices[merge.count + index] = (WORD)((long)indices[index] + offset);
++			merge.count += count;
++			merge.draws++;
++			return TRUE;
++		}
++	}
++	merge_flush();
++	sort_state_keep(&merge.first, type, count, indices);
++	memcpy(merge.indices, indices, count * sizeof(WORD));
++	merge.count = count;
++	merge.draws = 1;
++	merge.pending = TRUE;
++	return TRUE;
++}
++
++void d3d8_gl_merge_pass(int begin)
++{
++	static int allowed = -1;
++	static long flip = -1;
++
++	if (allowed < 0)
++	{
++		allowed = !getenv("HALO_GLES2_NO_MERGE");
++		flip = getenv("HALO_GLES2_SORT_FLIP") ? atol(getenv("HALO_GLES2_SORT_FLIP")) : 0;
++	}
++	merge_flush();
++	merge.on = begin && allowed && !(flip > 0 && (device.frame / (unsigned long)flip) % 2);
++	if (!begin && ++merge.frame % 600 == 0)
++	{
++		platform_log("GPU: merged passes: %lu draws a frame into %lu", merge.merged / 600, merge.runs / 600);
++		merge.merged = merge.runs = 0;
++	}
++}
++#endif
++
+ void WINAPI D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE primitive_type, UINT vertex_count, CONST WORD *index_data)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	draw_caller = __builtin_return_address(0); /* DEBUG */
++#endif
+ 	RENDER_TIME_BEGIN();
+ 	draw_indexed_vertices_untimed(primitive_type, vertex_count, index_data);
+ 	RENDER_TIME_END();
+@@ -6549,6 +7280,9 @@ static void end_untimed(void)
+ 	unsigned long offset, index, count = device.immediate_count;
+ 	D3DPRIMITIVETYPE type = device.immediate_type;
+ 
++#ifdef HALO_CONSOLE_GLES2
++	sort_flush();
++#endif
+ 	device.immediate_active = FALSE;
+ #ifdef HALO_BGFX
+ 	if (bg_active())
+@@ -6641,6 +7375,9 @@ static void end_untimed(void)
+ 
+ void WINAPI D3DDevice_End(void)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	draw_caller = __builtin_return_address(0); /* DEBUG */
++#endif
+ 	RENDER_TIME_BEGIN();
+ 	end_untimed();
+ 	RENDER_TIME_END();
+@@ -6796,6 +7533,9 @@ static void clear_untimed(DWORD count, CONST D3DRECT *rectangles, DWORD flags, D
+ 
+ void WINAPI D3DDevice_Clear(DWORD count, CONST D3DRECT *rectangles, DWORD flags, D3DCOLOR color, float z, DWORD stencil)
+ {
++#ifdef HALO_CONSOLE_GLES2
++	sort_flush();
++#endif
+ 	RENDER_TIME_BEGIN();
+ 	clear_untimed(count, rectangles, flags, color, z, stencil);
+ 	RENDER_TIME_END();
+@@ -7367,6 +8107,104 @@ void halo_test_screenshot(void)
+ 	test_screenshot_requested = TRUE;
+ }
+ 
++#if defined(HALO_CONSOLE_GLES2) && defined(__arm__)
++/* DEBUG: HALO_D3D_PAIRS=frame:file samples the process 1000 times a second
++of its time from that frame for 1200 frames, and writes each (pc, lr) pair
++with its count to the file: the callers of a library's leaf functions (the
++link register), which perf on the box cannot unwind to */
++#include <signal.h>
++#include <sys/time.h>
++#include <ucontext.h>
++
++#define PAIR_SLOTS 32768
++static volatile unsigned int pair_pc[PAIR_SLOTS], pair_lr[PAIR_SLOTS], pair_count[PAIR_SLOTS];
++
++static void pair_signal(int number, siginfo_t *information, void *context)
++{
++	ucontext_t *ucontext = context;
++	unsigned int pc = (unsigned int)ucontext->uc_mcontext.arm_pc, lr = (unsigned int)ucontext->uc_mcontext.arm_lr;
++	unsigned int slot = ((pc >> 2) ^ (lr * 2654435761u)) % PAIR_SLOTS, probe;
++
++	(void)number;
++	(void)information;
++	for (probe = 0; probe < 32; probe++, slot = (slot + 1) % PAIR_SLOTS)
++	{
++		if (!pair_count[slot] || (pair_pc[slot] == pc && pair_lr[slot] == lr))
++		{
++			pair_pc[slot] = pc;
++			pair_lr[slot] = lr;
++			pair_count[slot]++;
++			return;
++		}
++	}
++}
++
++static void pairs_frame(unsigned long frame)
++{
++	static long start = -2;
++	static const char *path;
++
++	if (start == -2)
++	{
++		const char *value = getenv("HALO_D3D_PAIRS");
++
++		start = value ? atol(value) : -1;
++		path = value ? strchr(value, ':') : NULL;
++		if (path)
++			path++;
++	}
++	if (start < 0 || !path)
++		return;
++	if (frame == (unsigned long)start)
++	{
++		struct sigaction action;
++		struct itimerval timer;
++
++		memset(&action, 0, sizeof(action));
++		action.sa_sigaction = pair_signal;
++		action.sa_flags = SA_SIGINFO | SA_RESTART;
++		sigaction(SIGPROF, &action, NULL);
++		timer.it_interval.tv_sec = 0;
++		timer.it_interval.tv_usec = 1000;
++		timer.it_value = timer.it_interval;
++		setitimer(ITIMER_PROF, &timer, NULL);
++	}
++	else if (frame == (unsigned long)start + 1200)
++	{
++		struct itimerval timer;
++		FILE *file, *maps, *copy;
++		char text[4096], maps_path[600];
++		size_t length;
++		unsigned int slot;
++
++		memset(&timer, 0, sizeof(timer));
++		setitimer(ITIMER_PROF, &timer, NULL);
++		file = fopen(path, "w");
++		if (file)
++		{
++			for (slot = 0; slot < PAIR_SLOTS; slot++)
++			{
++				if (pair_count[slot])
++					fprintf(file, "%08x %08x %u\n", pair_pc[slot], pair_lr[slot], pair_count[slot]);
++			}
++			fclose(file);
++		}
++		snprintf(maps_path, sizeof(maps_path), "%s.maps", path);
++		maps = fopen("/proc/self/maps", "r");
++		copy = fopen(maps_path, "w");
++		while (maps && copy && (length = fread(text, 1, sizeof(text), maps)) > 0)
++			fwrite(text, 1, length, copy);
++		if (maps)
++			fclose(maps);
++		if (copy)
++			fclose(copy);
++		platform_log("pairs: written to %s", path);
++	}
++}
++#else
++static void pairs_frame(unsigned long frame) { (void)frame; }
++#endif
++
+ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destination_rectangle,
+ 	void *unused, void *unused2)
+ {
+@@ -7600,6 +8438,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
+ 	prep_present();
+ #endif
+ 	device.frame++;
++	pairs_frame(device.frame);
+ 	stats.presents++;
+ #ifdef HALO_BGFX
+ 	if (debug_settings.statistics)
+diff --git a/port/linux/src/dsound_sdl.c b/port/linux/src/dsound_sdl.c
+index 34311dd68..3e93c9937 100644
+--- a/port/linux/src/dsound_sdl.c
++++ b/port/linux/src/dsound_sdl.c
+@@ -75,7 +75,10 @@ chooses stereo or 5.1 (port_config.c).
+ #include <time.h>
+ #include <unistd.h>
+ 
+-#define OUTPUT_RATE 48000
++/* the mix's rate: 48 kHz, or in performance mode on a console's own output
++lower (mix_rate_choose) */
++static unsigned long output_rate = 48000;
++#define OUTPUT_RATE output_rate
+ #define OUTPUT_CHANNELS 2 /* the stereo mix's, and the reverb's outputs */
+ #define MAXIMUM_OUTPUT_CHANNELS 8
+ #define MAXIMUM_STREAM_PACKETS 64
+@@ -190,6 +193,9 @@ struct sdl_stream
+ 	float current_direct_lowpass, current_room_lowpass;
+ 	float current_surround[2][MAXIMUM_OUTPUT_CHANNELS];
+ 	BOOL gains_valid;
++	/* left out of this mix by the voice cap (voice_cap_choose): moved on, not
++	mixed */
++	BOOL capped;
+ 	/* the direct path's low pass, for each channel, and the room send's */
+ 	float direct_lowpass[2];
+ 	float room_lowpass;
+@@ -261,6 +267,17 @@ static unsigned long environment_serial;
+ static BOOL reverb_enabled = TRUE;
+ /* audio.resampling = "linear" */
+ static BOOL resampling_linear = FALSE;
++/* the voices moved on silent (mix_voice), for HALO_AUDIO_STATS */
++static unsigned long skipped_silent;
++
++static BOOL silent_skip_allowed(void)
++{
++	static int allowed = -1;
++
++	if (allowed < 0)
++		allowed = !getenv("HALO_NO_SILENT_SKIP");
++	return allowed;
++}
+ /* audio.hrtf: whether 3D voices are rendered for headphones (hrtf_update),
+ and how far the mixer has faded to it (0 to 1) */
+ static volatile BOOL hrtf_wanted = FALSE;
+@@ -822,7 +839,8 @@ pan's: none on surround output or with audio.hrtf off, and the fade between
+ while it is turned on or off */
+ static float hrtf_share(const struct sdl_stream *stream)
+ {
+-	if (hrtf_level <= 0.0f || output_channels != 2 || !stream->has_3d || stream->mode == DS3DMODE_DISABLE)
++	if (hrtf_level <= 0.0f || output_channels != 2 || !stream->has_3d || stream->mode == DS3DMODE_DISABLE ||
++		output_rate != 48000)
+ 		return 0.0f;
+ 	return hrtf_level;
+ }
+@@ -1125,6 +1143,65 @@ static BOOL voice_has_frames(struct sdl_stream *stream)
+ 
+ /* mixes one voice into output (frames of output_channels floats), and into
+ the reverb's send (frames of mono) */
++/* the frames the voice has to take before its packets run out, up to
++wanted (all of them, for a looping packet with frames) */
++static unsigned long voice_frames_available(const struct sdl_stream *stream, unsigned long wanted)
++{
++	unsigned long position, available = 0;
++	BOOL first = TRUE;
++
++	for (position = 0; position < stream->packet_count && available < wanted; position++)
++	{
++		const struct voice_packet *packet = &stream->packets[(stream->packet_head + position) % MAXIMUM_STREAM_PACKETS];
++
++		if (packet->finished)
++			continue;
++		if (stream->looping && packet->frames)
++			return wanted;
++		available += first ? (packet->frames > stream->cursor ? packet->frames - stream->cursor : 0) : packet->frames;
++		first = FALSE;
++	}
++	return available < wanted ? available : wanted;
++}
++
++/* count frames moved past, as take_frame takes them, unheard (the caller
++has made sure the packets hold them: voice_frames_available) */
++static void skip_frames(struct sdl_stream *stream, unsigned long count)
++{
++	while (count)
++	{
++		struct voice_packet *packet = NULL;
++		unsigned long position;
++
++		for (position = 0; position < stream->packet_count; position++)
++		{
++			struct voice_packet *candidate = &stream->packets[(stream->packet_head + position) % MAXIMUM_STREAM_PACKETS];
++
++			if (!candidate->finished)
++			{
++				packet = candidate;
++				break;
++			}
++		}
++		if (!packet)
++			return;
++		if (stream->cursor < packet->frames)
++		{
++			unsigned long step = packet->frames - stream->cursor;
++
++			if (step > count)
++				step = count;
++			stream->cursor += step;
++			count -= step;
++			continue;
++		}
++		stream->cursor = 0;
++		if (stream->looping && packet->frames)
++			continue;
++		packet->finished = TRUE;
++	}
++}
++
+ static void mix_voice(struct sdl_stream *stream, float *output, float *send, unsigned long frames)
+ {
+ 	double step, ramp_step, base_step;
+@@ -1232,6 +1309,71 @@ static void mix_voice(struct sdl_stream *stream, float *output, float *send, uns
+ 		}
+ 	}
+ 
++	/* a voice silent all through this mix (out of earshot, sending nothing
++	to the reverb), with the frames it takes in its packets: moved on as the
++	loop below would move it, without taking its frames one at a time (in
++	performance mode, the box's mixer had a voice cost the same heard or
++	not). HALO_NO_SILENT_SKIP: the loop. */
++	if (silent_skip_allowed() && !surround && !binaural && !left && !right && !room && !target_left && !target_right &&
++		!target_room)
++	{
++		unsigned long center = stream->center, filled = stream->center, needed, kept;
++		double phase = stream->phase, moving = step;
++
++		for (frame = 0; frame < frames; frame++)
++		{
++			/* (the loop fills at each frame's center, before it moves on) */
++			filled = center;
++			phase += moving;
++			moving += ramp_step;
++			while (phase >= 1.0)
++			{
++				phase -= 1.0;
++				center++;
++			}
++		}
++		/* (the frames the loop takes: up to width past its last center) */
++		needed = (long)(stream->history_count - filled) > width ? 0 :
++			filled + (unsigned long)width + 1 - stream->history_count;
++		if (!needed || voice_frames_available(stream, needed) == needed)
++		{
++			/* (the newest frames go into the history, as the loop leaves
++			it: what the next mix's low pass reaches) */
++			kept = needed < RESAMPLER_HISTORY ? needed : RESAMPLER_HISTORY;
++			skip_frames(stream, needed - kept);
++			stream->history_count += needed - kept;
++			while (kept--)
++			{
++				unsigned long slot = stream->history_count % RESAMPLER_HISTORY;
++				float taken[2];
++
++				take_frame(stream, taken);
++				stream->history[0][slot] = stream->history[0][slot + RESAMPLER_HISTORY] = taken[0];
++				stream->history[1][slot] = stream->history[1][slot + RESAMPLER_HISTORY] = taken[1];
++				stream->history_count++;
++			}
++			if (needed)
++				stream->silence = 0;
++			/* (the direct low pass's state, decaying as the loop's would) */
++			for (frame = 0; frame < frames; frame++)
++			{
++				float sample_left = 0.0f, sample_right = 0.0f;
++
++				if (direct_lowpass || ramp_direct_lowpass)
++				{
++					sample_left = flush_denormal(sample_left + direct_lowpass * (direct_state[0] - sample_left));
++					sample_right = flush_denormal(sample_right + direct_lowpass * (direct_state[1] - sample_right));
++				}
++				direct_state[0] = sample_left;
++				direct_state[1] = sample_right;
++				direct_lowpass += ramp_direct_lowpass;
++			}
++			stream->center = center;
++			stream->phase = phase;
++			skipped_silent++;
++			goto mixed;
++		}
++	}
+ 	for (frame = 0; frame < frames; frame++)
+ 	{
+ 		float sample_left = 0.0f, sample_right = 0.0f;
+@@ -1260,7 +1402,7 @@ static void mix_voice(struct sdl_stream *stream, float *output, float *send, uns
+ 		if (stream->silence > (unsigned long)(2 * width))
+ 			break;
+ 
+-		if (!left && !right && !room && !ramp_left && !ramp_right && !ramp_room && !binaural)
++		if (stream->capped || (!left && !right && !room && !ramp_left && !ramp_right && !ramp_room && !binaural))
+ 		{
+ 			/* a voice turned all the way down (out of earshot), and not
+ 			sending to the reverb, only moves on */
+@@ -1366,6 +1508,7 @@ static void mix_voice(struct sdl_stream *stream, float *output, float *send, uns
+ 			stream->center++;
+ 		}
+ 	}
++mixed:
+ 	stream->direct_lowpass[0] = direct_state[0];
+ 	stream->direct_lowpass[1] = direct_state[1];
+ 	stream->room_lowpass = room_state;
+@@ -1434,9 +1577,21 @@ static struct
+ 
+ static void limit(float *output, unsigned long frames)
+ {
+-	float release = 1.0f - expf(-1.0f / (LIMITER_RELEASE_SECONDS * OUTPUT_RATE));
++	/* (worked out once a rate, not at every mix) */
++	static float release;
++	static unsigned long release_rate;
+ 	unsigned long frame, index, channel;
+ 
++	if (release_rate != OUTPUT_RATE)
++	{
++		release = 1.0f - expf(-1.0f / (LIMITER_RELEASE_SECONDS * OUTPUT_RATE));
++		release_rate = OUTPUT_RATE;
++	}
++	static int limiter_fast = -1;
++
++	if (limiter_fast < 0)
++		limiter_fast = !getenv("HALO_NO_LIMITER_FAST");
++
+ 	if (!limiter.initialized)
+ 	{
+ 		for (index = 0; index < LIMITER_LOOKAHEAD; index++)
+@@ -1465,6 +1620,17 @@ static void limit(float *output, unsigned long frames)
+ 		limiter.limiting -= limiter.needed[position] < 1.0f;
+ 		limiter.needed[position] = peak > LIMITER_CEILING ? LIMITER_CEILING / peak : 1.0f;
+ 		limiter.limiting += limiter.needed[position] < 1.0f;
++		/* (nothing turned down, now or in the look-ahead, and the gain back
++		at 1: the frame plays as it was, as the arithmetic below would give
++		it, exactly) */
++		if (!limiter.limiting && limiter.held == 1.0f && limiter.history_sum == (double)LIMITER_LOOKAHEAD &&
++			limiter_fast)
++		{
++			for (channel = 0; channel < output_channels; channel++)
++				sample[channel] = limiter.delay[oldest][channel];
++			limiter.position = oldest;
++			continue;
++		}
+ 		lowest = 1.0f;
+ 		if (limiter.limiting)
+ 		{
+@@ -1726,8 +1892,187 @@ static void hrtf_fade(unsigned long frames)
+ 	hrtf_level = clamp_real(target, hrtf_level - step, hrtf_level + step);
+ }
+ 
++/* ---------- the mix's rate (performance mode)
++
++Each voice costs the box's one core the same for every output frame. The
++game's sounds are mostly 22 kHz (its ADPCM), so in performance mode on the
++console's own output the voices are mixed at HALO_MIX_RATE (24 kHz, half the
++frames) and the firmware's SDL2 converts the mix to the output's 48 kHz,
++one stream instead of every voice: what is lost is the little above 12 kHz
++that the few 44 kHz sounds (the music) have. Off unless HALO_MIX_RATE asks. Chosen once, as the output
++opens; the headphone 3D's filters are made for 48 kHz and are left out at
++another rate. HALO_FULL_MIX_RATE: 48 kHz always. */
++#if defined(HALO_CONSOLE_PERFORMANCE_MODE)
++long console_performance_lines(void);
++#endif
++
++static void mix_rate_choose(void)
++{
++#if defined(HALO_CONSOLE_PERFORMANCE_MODE)
++	const char *wanted = getenv("HALO_MIX_RATE");
++	long rate = wanted ? atol(wanted) : 48000;
++
++	/* (opt in only: measured on the box, a 24 kHz mix took the mixer from
++	about 15% of the core to 10% on damnation, yet the frame took as long,
++	and a world voice went missing from the count; HALO_MIX_RATE=24000) */
++	if (!wanted || getenv("HALO_FULL_MIX_RATE") || console_performance_lines() <= 0 || rate < 11025 || rate >= 48000)
++		return;
++	output_rate = (unsigned long)rate;
++	platform_log("sound: mixed at %lu Hz (performance mode)", output_rate);
++#endif
++}
++
++/* ---------- the voice cap (performance mode)
++
++The box's one core mixes every voice for each output frame: in a fight, a
++dozen or more at once, a millisecond or two of a frame. In performance mode
++(console_performance_lines), at most audio.voice_cap's world voices (3D, at a
++place in the world, as gunfire, explosions and footsteps there are) are
++mixed, the loudest; the others are moved on through their sound unheard, so
++that each comes back where it would be once it is among the loudest again.
++Voices that are not world voices (the interface's, the HUD's, the player's
++own weapon and dialogue played to the listener: no 3D, or head-relative) are
++always mixed. HALO_NO_VOICE_CAP: every voice; HALO_VOICE_CAP=n: n world
++voices (8). HALO_AUDIO_STATS=1: the mixer's time and its voices in the log. */
++#define VOICE_CAP_MAXIMUM 64
++
++static struct
++{
++	int on, stats;
++	long cap;
++	/* (the stats: over a stats period) */
++	unsigned long mixes, active, world, capped, dropped_mixes;
++	unsigned long long nanoseconds, wall, limiter;
++	unsigned long long period_start;
++} voice_cap = { -1 };
++
++static float voice_loudness(const struct sdl_stream *stream)
++{
++	float left, right, room, direct_lowpass, room_lowpass;
++
++	voice_gains(stream, &left, &right, &room, &direct_lowpass, &room_lowpass);
++	return (left > right ? left : right) + room;
++}
++
++static BOOL voice_world(const struct sdl_stream *stream)
++{
++	return stream->has_3d && stream->mode == DS3DMODE_NORMAL;
++}
++
++static BOOL voice_playing(const struct sdl_stream *stream)
++{
++	return !stream->paused && stream->packet_count && stream->sample_rate;
++}
++
++/* each voice's capped, for this mix (under mixer_lock) */
++static void voice_cap_choose(void)
++{
++	struct sdl_stream *list[2] = { streams, buffers }, *stream;
++	struct sdl_stream *world[VOICE_CAP_MAXIMUM];
++	float loudness[VOICE_CAP_MAXIMUM];
++	unsigned long count = 0, index, other, active = 0;
++	BOOL cutting;
++	int which;
++
++	if (voice_cap.on < 0)
++	{
++		voice_cap.on = !getenv("HALO_NO_VOICE_CAP");
++		voice_cap.cap = getenv("HALO_VOICE_CAP") ? atol(getenv("HALO_VOICE_CAP")) : 8;
++		voice_cap.stats = getenv("HALO_AUDIO_STATS") != NULL;
++	}
++#if defined(HALO_CONSOLE_PERFORMANCE_MODE)
++	cutting = voice_cap.on && voice_cap.cap > 0 && console_performance_lines() > 0;
++#else
++	cutting = FALSE;
++#endif
++	for (which = 0; which < 2; which++)
++	{
++		for (stream = list[which]; stream; stream = stream->next)
++		{
++			BOOL was = stream->capped;
++
++			stream->capped = FALSE;
++			if (!voice_playing(stream))
++				continue;
++			active++;
++			if (!voice_world(stream))
++				continue;
++			if (count < VOICE_CAP_MAXIMUM)
++			{
++				world[count] = stream;
++				/* (one coming back starts at its gains, not ramped up from
++				where it was left: gains_valid) */
++				loudness[count] = cutting ? voice_loudness(stream) : 0.0f;
++				count++;
++			}
++			(void)was;
++		}
++	}
++	voice_cap.mixes++;
++	voice_cap.active += active;
++	voice_cap.world += count;
++	if (!cutting || count <= (unsigned long)voice_cap.cap)
++		return;
++	/* the quietest past the cap: each voice's rank is the louder ones' count
++	(the earlier of two as loud ranks first) */
++	for (index = 0; index < count; index++)
++	{
++		unsigned long louder = 0;
++
++		for (other = 0; other < count; other++)
++		{
++			if (loudness[other] > loudness[index] || (loudness[other] == loudness[index] && other < index))
++				louder++;
++		}
++		if (louder >= (unsigned long)voice_cap.cap)
++		{
++			world[index]->capped = TRUE;
++			world[index]->gains_valid = FALSE;
++			voice_cap.capped++;
++		}
++	}
++	voice_cap.dropped_mixes++;
++}
++
++static void voice_cap_stats(unsigned long long took)
++{
++	unsigned long long now = SDL_GetTicksNS();
++
++	if (!voice_cap.stats)
++		return;
++	voice_cap.nanoseconds += took;
++	if (!voice_cap.period_start)
++		voice_cap.period_start = now;
++	if (now - voice_cap.period_start < 10000000000ULL || !voice_cap.mixes)
++		return;
++	platform_log("audio: the mixer took %.2f ms a second of its thread's time (%.2f by the clock, %.2f the limiter's); voices a mix %.1f playing, %.1f in the world, %.2f left out "
++		"(in %lu of %lu mixes), %.1f moved on silent", (double)voice_cap.nanoseconds / 1e6 / ((double)(now - voice_cap.period_start) / 1e9),
++		(double)voice_cap.wall / 1e6 / ((double)(now - voice_cap.period_start) / 1e9),
++		(double)voice_cap.limiter / 1e6 / ((double)(now - voice_cap.period_start) / 1e9),
++		(double)voice_cap.active / voice_cap.mixes, (double)voice_cap.world / voice_cap.mixes,
++		(double)voice_cap.capped / voice_cap.mixes, voice_cap.dropped_mixes, voice_cap.mixes,
++		(double)skipped_silent / voice_cap.mixes);
++	skipped_silent = 0;
++	voice_cap.mixes = voice_cap.active = voice_cap.world = voice_cap.capped = voice_cap.dropped_mixes = 0;
++	voice_cap.nanoseconds = 0;
++	voice_cap.wall = 0;
++	voice_cap.limiter = 0;
++	voice_cap.period_start = now;
++}
++
++/* (the audio thread's own processor time, in nanoseconds: the wall clock
++counts the game's thread too, which runs whenever the mixer lets it in) */
++static unsigned long long thread_nanoseconds(void)
++{
++	struct timespec now;
++
++	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
++	return (unsigned long long)now.tv_sec * 1000000000ULL + (unsigned long long)now.tv_nsec;
++}
++
+ static void mix(float *output, unsigned long frames)
+ {
++	unsigned long long mix_start = voice_cap.stats ? thread_nanoseconds() : 0, wall_start = SDL_GetTicksNS();
+ 	struct sdl_stream *stream;
+ 	DSI3DL2LISTENER properties;
+ 	BOOL enabled = reverb_enabled, changed = FALSE;
+@@ -1738,6 +2083,7 @@ static void mix(float *output, unsigned long frames)
+ 	memset(reverb.send, 0, frames * sizeof(float));
+ 	hrtf_fade(frames);
+ 	pthread_mutex_lock(&mixer_lock);
++	voice_cap_choose();
+ 	/* (a voice at a time, the game let in between them: mixer_lock_wanted) */
+ 	for (stream = streams; stream; stream = mix_cursor)
+ 	{
+@@ -1780,7 +2126,16 @@ static void mix(float *output, unsigned long frames)
+ 		for (index = 0; index < frames * capture.channels; index++)
+ 			capture.reverb[index] = output[index] - capture.dry[index];
+ 	}
+-	limit(output, frames);
++	{
++		unsigned long long limit_start = voice_cap.stats ? thread_nanoseconds() : 0;
++
++		limit(output, frames);
++		if (voice_cap.stats)
++			voice_cap.limiter += thread_nanoseconds() - limit_start;
++	}
++	if (voice_cap.stats)
++		voice_cap.wall += SDL_GetTicksNS() - wall_start;
++	voice_cap_stats(voice_cap.stats ? thread_nanoseconds() - mix_start : 0);
+ 	if (capturing)
+ 		capture_push(output, frames);
+ #ifdef HALO_CAPTURE
+@@ -2097,6 +2452,7 @@ static void audio_start(void)
+ 		/* the console's own output, where SDL has none (the Steam Link's:
+ 		its HDMI audio is the firmware's own SDL's) */
+ 		output_channels = 2;
++		mix_rate_choose();
+ 		if (console_audio_start(OUTPUT_RATE, (int)output_channels, mix))
+ 		{
+ 			platform_log("sound: the console's own output");
+diff --git a/port/linux/src/dsound_xbox_hrtf.inl b/port/linux/src/dsound_xbox_hrtf.inl
+index 4f9cca087..5244ee205 100644
+--- a/port/linux/src/dsound_xbox_hrtf.inl
++++ b/port/linux/src/dsound_xbox_hrtf.inl
+@@ -323,6 +323,24 @@ static struct
+ 	float lowpass[HRTF_BANDS - 1][4];
+ } hrtf;
+ 
++/* NEON for hrtf_process's filters, on a console's ARM build
++(HALO_NO_NEON_HRTF: the plain loop) */
++#if defined(__ARM_NEON) && defined(HALO_CONSOLE_AUDIO_OUTPUT)
++#include <arm_neon.h>
++#define HRTF_NEON 1
++
++static int hrtf_neon_allowed(void)
++{
++	static int allowed = -1;
++
++	if (allowed < 0)
++		allowed = !getenv("HALO_NO_NEON_HRTF");
++	return allowed;
++}
++#else
++#define HRTF_NEON 0
++#endif
++
+ static void hrtf_initialize(void)
+ {
+ 	int band;
+@@ -533,6 +551,76 @@ static void hrtf_process(struct sdl_stream *stream, const float *direct, float *
+ 	ramp.pair[0] = (target->pair[0] - now.pair[0]) * share;
+ 	ramp.pair[1] = (target->pair[1] - now.pair[1]) * share;
+ 	memcpy(state, stream->hrtf_bands, sizeof(state));
++#if HRTF_NEON
++	/* (NEON: the eight low passes four at a time, each ear's weighting of
++	them too, summed in the order the loop below sums them; the same
++	arithmetic, as the states are kept clear of denormals) */
++	if (hrtf_neon_allowed())
++	{
++		float32x4x4_t c[2];
++		float32x4x2_t st[2];
++		const float32x4_t tiny = vdupq_n_f32(1.0e-20f), zero = vdupq_n_f32(0.0f);
++
++		c[0] = vld4q_f32(&hrtf.lowpass[0][0]);
++		c[1] = vld4q_f32(&hrtf.lowpass[4][0]);
++		st[0] = vld2q_f32(&state[0][0]);
++		st[1] = vld2q_f32(&state[4][0]);
++		for (frame = 0; frame < frames; frame++)
++		{
++			float x = direct[frame];
++			float32x4_t xv = vdupq_n_f32(x), low[2];
++			int group;
++
++			for (group = 0; group < 2; group++)
++			{
++				float32x4_t y = vaddq_f32(vmulq_f32(c[group].val[0], xv), st[group].val[0]);
++				float32x4_t s0 = vaddq_f32(vsubq_f32(vmulq_f32(c[group].val[1], xv), vmulq_f32(c[group].val[2], y)),
++					st[group].val[1]);
++				float32x4_t s1 = vsubq_f32(vmulq_f32(c[group].val[0], xv), vmulq_f32(c[group].val[3], y));
++
++				st[group].val[0] = vbslq_f32(vcltq_f32(vabsq_f32(s0), tiny), zero, s0);
++				st[group].val[1] = vbslq_f32(vcltq_f32(vabsq_f32(s1), tiny), zero, s1);
++				low[group] = y;
++			}
++			for (ear = 0; ear < 2; ear++)
++			{
++				const float *weights = now.weights[ear];
++				float products[8];
++				float heard = weights[HRTF_BANDS - 1] * x;
++
++				vst1q_f32(products, vmulq_f32(vld1q_f32(weights), low[0]));
++				vst1q_f32(products + 4, vmulq_f32(vld1q_f32(weights + 4), low[1]));
++				for (band = 0; band < HRTF_BANDS - 1; band++)
++					heard += products[band];
++				line[ear][HRTF_FRAMES + frame] = heard;
++				heard = hrtf_read(line[ear] + HRTF_FRAMES + frame, 1.0f + now.delay[ear]) * now.gain * mix;
++				if (output_channels == 6)
++				{
++					output[frame * 6 + ear] += heard * now.pair[0];
++					output[frame * 6 + 4 + ear] += heard * now.pair[1];
++				}
++				else
++					output[frame * 2 + ear] += heard;
++			}
++			if (frame + 1 == ramp_frames)
++			{
++				memcpy(now.delay, target->delay, sizeof(now.delay));
++				memcpy(now.weights, target->weights, sizeof(now.weights));
++				now.gain = target->gain;
++				now.pair[0] = target->pair[0];
++				now.pair[1] = target->pair[1];
++				memset(&ramp, 0, sizeof(ramp));
++			}
++			else
++				hrtf_step(&now, &ramp);
++			mix = hrtf_mix_step(mix, ramp_mix, mix_end);
++		}
++		vst2q_f32(&state[0][0], st[0]);
++		vst2q_f32(&state[4][0], st[1]);
++		frame = frames;
++	}
++	else
++#endif
+ 	for (frame = 0; frame < frames; frame++)
+ 	{
+ 		/* the low passes (transposed direct form II), then each ear its
+diff --git a/port/linux/src/menu_files.c b/port/linux/src/menu_files.c
+index 52a36c6b4..3978fa50b 100644
+--- a/port/linux/src/menu_files.c
++++ b/port/linux/src/menu_files.c
+@@ -1093,6 +1093,8 @@ static struct
+ 	int cyborg;
+ } art[MAXIMUM_ART];
+ static long art_count;
++/* changed whenever the art registered changes (menu_art_changes) */
++static unsigned long art_changes = 1;
+ #ifdef HALO_CONSOLE_HOST_ART
+ /* changed whenever the art registered changes (menu_art_serial) */
+ static unsigned long art_serial = 1;
+@@ -1134,6 +1136,7 @@ void halo_menus_art_register(void const *texture, char const *png)
+ 	memset(&art[index], 0, sizeof(art[index]));
+ 	art[index].data = data;
+ 	art[index].png = strdup(png);
++	art_changes++;
+ #ifdef HALO_CONSOLE_HOST_ART
+ 	art_serial++;
+ #endif
+@@ -1154,6 +1157,7 @@ void halo_menus_art_forget(void)
+ #endif
+ 	}
+ 	art_count = 0;
++	art_changes++;
+ #ifdef HALO_CONSOLE_HOST_ART
+ 	art_serial++;
+ #endif
+@@ -1184,6 +1188,13 @@ static const char *cyborg_title(const char *png, char *path, size_t size)
+ 	return path;
+ }
+ 
++/* a number that changes whenever the bitmaps registered do: a texture that
++was none of them is none until it changes (xbox_textures.c) */
++unsigned long menu_art_changes(void)
++{
++	return art_changes;
++}
++
+ unsigned int menu_art_texture(unsigned long data, unsigned long *levels)
+ {
+ 	long index;
+diff --git a/port/linux/src/menu_files.h b/port/linux/src/menu_files.h
+index 3d9993d21..4dd13ad7e 100644
+--- a/port/linux/src/menu_files.h
++++ b/port/linux/src/menu_files.h
+@@ -23,6 +23,7 @@ extern const unsigned int menu_files_embedded_count;
+ /* the GL texture standing for a menu bitmap's D3D texture (data: its Data),
+ decoded from its PNG on first use, and its mip levels; 0 if it is none */
+ unsigned int menu_art_texture(unsigned long data, unsigned long *levels);
++unsigned long menu_art_changes(void);
+ 
+ #ifdef HALO_CONSOLE_HOST_ART
+ /* for a console's own renderer (the Switch's deko3d renderer): the file of
+diff --git a/port/linux/src/port_config.c b/port/linux/src/port_config.c
+index 16597dfb4..795597e22 100644
+--- a/port/linux/src/port_config.c
++++ b/port/linux/src/port_config.c
+@@ -4874,6 +4874,37 @@ static const struct config_value *config_value(const char *name, enum config_typ
+ 	static const struct config_value none = { 0, 0, 0.0, "" };
+ 	long index;
+ 
++	{ /* DEBUG: HALO_CONFIG_COUNT logs the names asked for most, each 50000 asks */
++		static int counting = -1;
++		static const char *names[64];
++		static unsigned long counts[64], total;
++
++		if (counting < 0)
++			counting = getenv("HALO_CONFIG_COUNT") != NULL;
++		if (counting)
++		{
++			unsigned long slot;
++
++			for (slot = 0; slot < 64 && names[slot] && names[slot] != name; slot++)
++			{
++			}
++			if (slot < 64)
++			{
++				names[slot] = name;
++				counts[slot]++;
++			}
++			if (++total % 50000 == 0)
++			{
++				for (slot = 0; slot < 64 && names[slot]; slot++)
++				{
++					if (counts[slot] > 500)
++						platform_log("config asks: %s %lu", names[slot], counts[slot]);
++					counts[slot] = 0;
++				}
++			}
++		}
++	}
++
+ 	pthread_mutex_lock(&config_lock);
+ 	if (!config_loaded)
+ 	{
+diff --git a/port/linux/src/xbox_textures.c b/port/linux/src/xbox_textures.c
+index 0822adf39..5bdebfa30 100644
+--- a/port/linux/src/xbox_textures.c
++++ b/port/linux/src/xbox_textures.c
+@@ -1153,6 +1153,9 @@ of its settings' changes (hud_hires_settings) */
+ 	memory watch serial read before it was found: the same while no watched
+ 	page has been written since (0: never found) */
+ 	unsigned long watched_serial, watched_generation;
++	/* the menus' art changes (menu_art_changes) as of when its data was
++	found to be none of their bitmaps (0: not looked) */
++	unsigned long no_art_changes;
+ };
+ 
+ #define TEXTURE_BUCKET_COUNT 4096
+@@ -1224,10 +1227,21 @@ static GLuint texture_entry_result(struct texture_entry *entry, GLenum *target,
+ 			return atlas;
+ 		}
+ 	}
+-	/* (a menu's bitmap: menu_files.h) */
++	/* (a menu's bitmap: menu_files.h; looked for once a change of them, a
++	walk over every bitmap registered at each bind else.
++	HALO_NO_TEXTURE_ART_CACHE: at each bind) */
+ 	{
+-		unsigned long levels;
+-		GLuint art = menu_art_texture(entry->data, &levels);
++		static int caching = -1;
++		unsigned long levels, changes = menu_art_changes();
++		GLuint art = 0;
++
++		if (caching < 0)
++			caching = !getenv("HALO_NO_TEXTURE_ART_CACHE");
++		if (!caching || entry->no_art_changes != changes)
++		{
++			art = menu_art_texture(entry->data, &levels);
++			entry->no_art_changes = art ? 0 : changes;
++		}
+ 
+ 		if (art)
+ 		{
+diff --git a/source/rasterizer/xbox/rasterizer_xbox_models.c b/source/rasterizer/xbox/rasterizer_xbox_models.c
+index f3f1eaa43..503c10a1a 100644
+--- a/source/rasterizer/xbox/rasterizer_xbox_models.c
++++ b/source/rasterizer/xbox/rasterizer_xbox_models.c
+@@ -136,6 +136,10 @@ long rasterizer_frame_statistics_count_static_vertices(
+ 
+ #include "needler_lighting.h" /* port: port/linux/game/needler_lighting.c */
+ #include "ammo_counter_lighting.h" /* port: port/linux/game/ammo_counter_lighting.c */
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++/* port: steamlink_performance.c */
++boolean console_performance_one_reflection_permutation(void);
++#endif
+ 
+ /* ---------- constants */
+ 
+@@ -1318,7 +1322,15 @@ void rasterizer_model_draw_environment_shader(
+ 			}
+ 			else if (shader_environment->environment.reflection.cube_map.index ==
+ 					NONE &&
+-				local_parameters->skinning.node_matrix_count <= 1)
++				local_parameters->skinning.node_matrix_count <= 1
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++				/* port: in performance mode the one-node part drawn with the
++				reflection permutation too, as its object's other parts are:
++				the same pixel shader, and one program where the parts took
++				turns at two (a change of program a part) */
++				&& !console_performance_one_reflection_permutation()
++#endif
++				)
+ 			{
+ 				vertex_shader_permutation =
+ 					_model_vertex_shader_permutation_reflection_one_node;
+diff --git a/source/render/render.c b/source/render/render.c
+index f9e6bccde..6b669b95b 100644
+--- a/source/render/render.c
++++ b/source/render/render.c
+@@ -103,6 +103,9 @@ symbols in this file:
+ boolean console_performance_fused_level_passes(void);
+ void structure_render_lightmaps_and_textures(void);
+ static boolean level_passes_fused;
++boolean console_performance_sorted_objects(void);
++void d3d8_gl_sort_pass(int begin);
++void d3d8_gl_merge_pass(int begin);
+ #endif
+ 
+ /* ---------- constants */
+@@ -460,6 +463,17 @@ static void render_window(
+ 		HALO_PERF_RENDER_PART(_halo_perf_render_world);
+ 		lights_preprocess_scene();
+ 		HALO_PERF_RENDER_PART(_halo_perf_render_objects);
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++		/* port: the objects' opaque draws grouped by their programs
++		(d3d8_gl.c's sorted passes) */
++		if (console_performance_sorted_objects())
++		{
++			d3d8_gl_sort_pass(TRUE);
++			render_objects();
++			d3d8_gl_sort_pass(FALSE);
++		}
++		else
++#endif
+ 		render_objects();
+ #ifdef HALO_SHADER_PREP
+ 		/* port: and through every model's parts */
+@@ -532,6 +546,17 @@ static void render_window(
+ 		HALO_PERF_RENDER_PART(_halo_perf_render_transparent);
+ 		structure_render_transparent_geometry();
+ 		HALO_PERF_RENDER_PART(_halo_perf_render_world);
++#if defined(HALO_CONSOLE_GLES2) && defined(HALO_CONSOLE_PERFORMANCE_MODE)
++		/* port: the fog's draws of one state as one draw (d3d8_gl.c's
++		merged passes) */
++		if (console_performance_sorted_objects())
++		{
++			d3d8_gl_merge_pass(TRUE);
++			structure_render_fog();
++			d3d8_gl_merge_pass(FALSE);
++		}
++		else
++#endif
+ 		structure_render_fog();
+ 		HALO_PERF_RENDER_PART(_halo_perf_render_objects);
+ 		game_engine_post_rasterize_objects();
+diff --git a/source/structures/structure_render.c b/source/structures/structure_render.c
+index b5a9ea145..e85668d07 100644
+--- a/source/structures/structure_render.c
++++ b/source/structures/structure_render.c
+@@ -675,6 +675,8 @@ void _rasterizer_environment_fused_draw(
+ 	long triangle_count,
+ 	struct vertex_buffer const *vertex_buffer);
+ 
++void d3d8_gl_fuse_pass(int begin);
++
+ void structure_render_lightmaps_and_textures(
+ 	void)
+ {
+@@ -691,6 +693,7 @@ void structure_render_lightmaps_and_textures(
+ 		}
+ 
+ 		rasterizer_environment_lightmaps_begin();
++		d3d8_gl_fuse_pass(TRUE);
+ 
+ 		structure_render_pass(
+ 			render.environment_surface_indices,
+@@ -701,6 +704,7 @@ void structure_render_lightmaps_and_textures(
+ 			rasterizer_environment_lightmap_end,
+ 			NULL);
+ 
++		d3d8_gl_fuse_pass(FALSE);
+ 		rasterizer_environment_lightmaps_end();
+ 		rasterizer_globals.lightmap_mode = saved_lightmap_mode;
+ 	}
+diff --git a/VERSION b/VERSION
+index df6b01fec..4f3f307e3 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-0.9.1a
++0.9.1b

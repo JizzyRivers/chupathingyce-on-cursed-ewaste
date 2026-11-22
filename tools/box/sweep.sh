@@ -11,10 +11,12 @@ for map in "$@"; do
 	sync; umount $stick
 	echo "$app/run.sh" > /tmp/launch_cmdline.txt
 	killall shell
-	i=0; peak=0
+	i=0; peak=0; p=
 	while [ $i -lt $LIMIT ]; do
 		sleep 5; i=$((i+5))
-		p=$(pidof halo)
+		# (pidof scans all of /proc, about a tenth of a second of the box's one
+		# core: once, then the same process asked after by its /proc entry)
+		[ -n "$p" ] && [ -d /proc/$p ] || p=$(pidof halo)
 		if [ -n "$p" ]; then
 			r=$(awk '/VmHWM/ {print $2}' /proc/$p/status 2>/dev/null)
 			[ -n "$r" ] && peak=$r

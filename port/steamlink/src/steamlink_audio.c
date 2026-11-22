@@ -17,6 +17,7 @@ open the output cannot be opened.
 #include "platform.h"
 
 #include <dlfcn.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* SDL2's, as SDL_audio.h has them */
@@ -51,18 +52,45 @@ static int audio_channels;
 The game takes it over rather than opening it twice) */
 static int audio_open_rate;
 
+/* (whole chunks mixed ahead, the frames a request leaves over kept for the
+next: at another rate than the output's, the firmware's SDL2 asks for a
+few dozen frames at a time, and each mix has its cost whatever its length,
+each voice's gains worked out again. HALO_AUDIO_SMALL_MIXES: mixed as
+asked) */
+static float audio_left_over[MIX_CHUNK_FRAMES * 2];
+static unsigned long audio_left_over_frames, audio_left_over_first;
+
 static void audio_callback(void *userdata, unsigned char *stream, int length)
 {
+	static int whole = -1;
 	float *output = (float *)stream;
 	unsigned long frames = (unsigned long)length / ((unsigned long)audio_channels * sizeof(float));
+	unsigned long channels = (unsigned long)audio_channels;
 
 	(void)userdata;
+	if (whole < 0)
+		whole = !getenv("HALO_AUDIO_SMALL_MIXES") && audio_channels <= 2;
 	while (frames)
 	{
 		unsigned long chunk = frames > MIX_CHUNK_FRAMES ? MIX_CHUNK_FRAMES : frames;
 
-		audio_mix(output, chunk);
-		output += chunk * (unsigned long)audio_channels;
+		if (whole)
+		{
+			if (!audio_left_over_frames)
+			{
+				audio_mix(audio_left_over, MIX_CHUNK_FRAMES);
+				audio_left_over_frames = MIX_CHUNK_FRAMES;
+				audio_left_over_first = 0;
+			}
+			if (chunk > audio_left_over_frames)
+				chunk = audio_left_over_frames;
+			memcpy(output, audio_left_over + audio_left_over_first * channels, chunk * channels * sizeof(float));
+			audio_left_over_first += chunk;
+			audio_left_over_frames -= chunk;
+		}
+		else
+			audio_mix(output, chunk);
+		output += chunk * channels;
 		frames -= chunk;
 	}
 }
@@ -111,7 +139,8 @@ int console_audio_start(int rate, int channels, void (*mix)(float *output, unsig
 	wanted.freq = rate;
 	wanted.format = SDL2_AUDIO_F32LSB;
 	wanted.channels = (unsigned char)channels;
-	wanted.samples = OUTPUT_FRAMES;
+	/* (the same time a buffer at a lower rate: dsound_sdl.c's mix_rate_choose) */
+	wanted.samples = (unsigned short)(rate < 48000 ? OUTPUT_FRAMES / 2 : OUTPUT_FRAMES);
 	wanted.callback = audio_callback;
 	/* (exactly as asked: SDL2 converts to what the output takes) */
 	device = open_device(NULL, 0, &wanted, &given, SDL2_AUDIO_ALLOW_NONE);

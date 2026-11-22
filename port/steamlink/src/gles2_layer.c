@@ -194,6 +194,20 @@ static struct
 	GLfloat values[2][4][4];
 } border_programs[LAYER_TRACKED];
 static void border_uniforms_apply(void);
+static void position_uniforms_apply(void);
+/* a program linked by vertex_pruned_link with its position's conversion
+taken out of its vertex shader: the two vectors it is now, worked out from
+the values the shader keeps of what they come from (position_uniforms_apply) */
+struct position_program
+{
+	GLint scale, offset;
+	/* viewport_scale, viewport_offset, c_58, c_59, screen_offset */
+	GLint from[5];
+	GLfloat last[17];
+	int given;
+};
+static struct position_program *position_programs[LAYER_TRACKED];
+
 static GLuint sampler_next = 1;
 static GLuint active_unit;
 /* the textures bound to each unit: [0] 2D, [1] cube */
@@ -866,7 +880,41 @@ struct layer_buffer
 	GLuint gpu;
 	/* -1 for a name made with nothing in it yet */
 	GLsizeiptr size;
+	/* an aliased buffer's: each 4 KB page's upload_generation at its latest
+	upload (the packed normals' copies: normals_stream) */
+	unsigned int *pages;
 };
+
+/* counts the aliased buffers' uploads */
+static unsigned int upload_generation = 1;
+
+static void buffer_pages_uploaded(struct layer_buffer *buffer, GLintptr offset, GLsizeiptr size)
+{
+	GLintptr page;
+
+	if (!buffer->pages || size <= 0)
+		return;
+	upload_generation++;
+	for (page = offset >> 12; page <= (offset + size - 1) >> 12; page++)
+		buffer->pages[page] = upload_generation;
+}
+
+/* whether bytes start to end of an aliased buffer are as they were at
+generation since */
+static int buffer_pages_unchanged(const struct layer_buffer *buffer, unsigned long start, unsigned long end,
+	unsigned int since)
+{
+	unsigned long page;
+
+	if (!buffer->pages || end <= start || end > (unsigned long)buffer->size)
+		return 0;
+	for (page = start >> 12; page <= (end - 1) >> 12; page++)
+	{
+		if (buffer->pages[page] > since)
+			return 0;
+	}
+	return 1;
+}
 
 static struct layer_buffer buffers[LAYER_TRACKED];
 static GLuint buffer_next = 1;
@@ -920,6 +968,8 @@ static void GL_APIENTRY layer_DeleteBuffers(GLsizei count, const GLuint *names)
 			continue;
 		if (!buffer->aliased)
 			free(buffer->data);
+		free(buffer->pages);
+		buffer->pages = NULL;
 		buffer->data = NULL;
 		buffer->aliased = 0;
 		buffer->size = 0;
@@ -972,6 +1022,7 @@ static void GL_APIENTRY layer_BufferSubData(GLenum target, GLintptr offset, GLsi
 	/* (an aliased buffer's upload from its own memory: already there) */
 	if (buffer->data + offset != data)
 		memcpy(buffer->data + offset, data, (size_t)size);
+	buffer_pages_uploaded(buffer, offset, size);
 	if (buffer->gpu)
 	{
 		real.BindBuffer(GL_ARRAY_BUFFER, buffer->gpu);
@@ -994,6 +1045,8 @@ void console_gl_buffer_alias(GLenum target, void *memory, unsigned long size)
 	buffer->data = memory;
 	buffer->size = (GLsizeiptr)size;
 	buffer->aliased = 1;
+	free(buffer->pages);
+	buffer->pages = calloc(size / 4096 + 1, sizeof(*buffer->pages));
 	/* (and a GPU buffer of it, empty: the renderer uploads each page before
 	the first draw from it and as the game changes it, layer_BufferSubData;
 	much of the window is not memory at all, and reading it faults) */
@@ -1023,6 +1076,8 @@ struct layer_vertex_array
 {
 	int used;
 	unsigned int enabled;
+	/* the attributes that are packed normals (normals_apply) */
+	unsigned int packed;
 	GLuint element_buffer;
 	struct layer_attribute attributes[LAYER_ATTRIBUTES];
 };
@@ -1038,8 +1093,32 @@ static struct layer_vertex_array *vertex_array(void)
 	return &vertex_arrays[vertex_array_current];
 }
 
+/* what a packed normal attribute was last pointed at (normals_apply): the
+GPU buffer and offset, or the client memory */
+static struct
+{
+	GLuint gpu;
+	const void *pointer;
+} normals_applied[LAYER_ATTRIBUTES];
+
+static int normals_flat(void);
+static void attribute_point(GLuint index, const struct layer_attribute *attribute);
+
 /* the attribute as a client array, in its buffer's memory */
 static void attribute_apply(GLuint index, const struct layer_attribute *attribute)
+{
+	if (index < LAYER_ATTRIBUTES)
+	{
+		normals_applied[index].gpu = 0;
+		normals_applied[index].pointer = NULL;
+	}
+	/* (a packed normal's copy is pointed at as the draw needs it) */
+	if (index < LAYER_ATTRIBUTES && (vertex_array()->packed & (1u << index)) && !normals_flat())
+		return;
+	attribute_point(index, attribute);
+}
+
+static void attribute_point(GLuint index, const struct layer_attribute *attribute)
 {
 	struct layer_buffer *buffer = buffer_get(attribute->buffer);
 
@@ -1166,18 +1245,38 @@ static void GL_APIENTRY layer_VertexAttribPointer(GLuint index, GLint size, GLen
 	attribute->normalized = normalized;
 	attribute->stride = stride;
 	attribute->pointer = pointer;
+	vertex_array()->packed &= ~(1u << index);
 	attribute_apply(index, attribute);
 }
 
 static void GL_APIENTRY layer_VertexAttribIPointer(GLuint index, GLint size, GLenum type, GLsizei stride,
 	const void *pointer)
 {
-	/* (the packed normals, D3DVSDT_NORMPACKED3: no integer attributes in
-	ES 2, and unpacking them, in the shader or for each draw, either does not
-	fit the skinned shaders or costs a tenth of a frame) */
-	LAYER_ONCE("integer vertex attributes read as floats (packed normals are flat)");
-	layer_VertexAttribPointer(index, size, type == GL_UNSIGNED_INT || type == GL_INT ? GL_UNSIGNED_SHORT : type,
-		GL_FALSE, stride, pointer);
+	struct layer_attribute *attribute;
+
+	/* (the packed normals, D3DVSDT_NORMPACKED3, the renderer's only integer
+	attribute: no integer attributes in ES 2, nor room in the skinned
+	shaders to unpack them. Each draw reads a copy of them as normalized
+	shorts, made once for the vertices it is of: normals_apply) */
+	if (index >= (GLuint)attribute_maximum || index >= LAYER_ATTRIBUTES)
+		return;
+	if (size != 1 || (type != GL_UNSIGNED_INT && type != GL_INT))
+	{
+		LAYER_ONCE("integer vertex attributes read as floats");
+		layer_VertexAttribPointer(index, size, type == GL_UNSIGNED_INT || type == GL_INT ? GL_UNSIGNED_SHORT : type,
+			GL_FALSE, stride, pointer);
+		return;
+	}
+	attribute = &vertex_array()->attributes[index];
+	attribute->buffer = array_buffer;
+	/* (as before, for HALO_GLES2_FLAT_NORMALS: read and not used) */
+	attribute->size = 1;
+	attribute->type = GL_UNSIGNED_SHORT;
+	attribute->normalized = GL_FALSE;
+	attribute->stride = stride ? stride : 4;
+	attribute->pointer = pointer;
+	vertex_array()->packed |= 1u << index;
+	attribute_apply(index, attribute);
 }
 
 static void GL_APIENTRY layer_VertexAttribI4ui(GLuint index, GLuint x, GLuint y, GLuint z, GLuint w)
@@ -1210,6 +1309,12 @@ static void index_range(GLenum type, const void *indices, GLsizei count, unsigne
 }
 
 static GLuint program_current;
+/* the program the renderer made current (program_current is its flat
+twin's while that stands in for it: twin_draw_begin), and the twins */
+static GLuint program_renderer;
+struct twin;
+static struct twin *twins[LAYER_TRACKED];
+static void twin_frame(void);
 /* (the renderer's program made the driver's again after the layer's own; a
 lazy program not yet loaded is not the driver's to use, program_ready) */
 static int program_is_pending(GLuint program);
@@ -1856,8 +1961,399 @@ static void draw_flush_maybe(void)
 		flush();
 }
 
+/* ---------- the packed normals
+
+The models' normals (and binormals, tangents) are D3DVSDT_NORMPACKED3, 11,
+11 and 10 bits in a 32-bit word, which ES 2 has no integer attributes for
+and the box's compiler no room to unpack in the skinned shaders. A draw
+reads a copy of them as normalized shorts instead (the shader's
+unpack_normpacked3 then only passes them on). A stream in the mirror's
+buffers (the models' own vertices, drawn every frame) has its copy in a GPU
+buffer, made at its first draw and again only when the game has written
+its pages since (buffer_pages_uploaded) or a draw reaches past it; the
+indices' range of a draw from the mirror is kept the same way. A streamed
+draw's are unpacked for the draw. HALO_GLES2_FLAT_NORMALS: every normal
+straight up, as before. */
+
+static int normals_flat(void)
+{
+	static int flat = -1;
+
+	if (flat < 0)
+		flat = getenv("HALO_GLES2_FLAT_NORMALS") != NULL;
+	return flat;
+}
+
+static void normals_unpack(const unsigned char *source, GLsizei stride, unsigned long first, unsigned long last,
+	GLshort *to)
+{
+	unsigned long vertex;
+
+	for (vertex = first; vertex <= last; vertex++, to += 4)
+	{
+		uint32_t packed;
+		int x, y, z;
+
+		memcpy(&packed, source + vertex * (unsigned long)stride, 4);
+		x = (int32_t)(packed << 21) >> 21;
+		y = (int32_t)(packed << 10) >> 21;
+		z = (int32_t)packed >> 22;
+		/* (x / 1023, y / 1023, z / 511, as nv2a_vsh.c's, in shorts) */
+		x = (x * 32767 + (x < 0 ? -511 : 511)) / 1023;
+		y = (y * 32767 + (y < 0 ? -511 : 511)) / 1023;
+		z = (z * 32767 + (z < 0 ? -255 : 255)) / 511;
+		to[0] = (GLshort)(x < -32767 ? -32767 : x > 32767 ? 32767 : x);
+		to[1] = (GLshort)(y < -32767 ? -32767 : y > 32767 ? 32767 : y);
+		to[2] = (GLshort)(z < -32767 ? -32767 : z > 32767 ? 32767 : z);
+		to[3] = 32767;
+	}
+}
+
+#define NORMAL_STREAMS 1024
+#define NORMAL_RANGES 2048
+
+static struct normal_stream
+{
+	GLuint buffer;
+	uintptr_t pointer;
+	GLsizei stride;
+	GLuint gpu;
+	/* vertices 0 to this less one copied, as of generation built (checked:
+	the generation its pages were last found unchanged at) */
+	unsigned long vertices;
+	unsigned int built, checked;
+	/* draws_total at its latest draw */
+	unsigned long used;
+} normal_streams[NORMAL_STREAMS];
+
+static unsigned long normals_hash(unsigned long a, unsigned long b, unsigned long c)
+{
+	unsigned long hash = (unsigned long)((a * 2654435761u) ^ (b * 0x9e3779b1u) ^ (c * 0x85ebca6bu));
+
+	hash ^= hash >> 15;
+	hash *= 0x2c1b3c6du;
+	return hash ^ (hash >> 13);
+}
+
+static struct normal_range
+{
+	GLuint buffer;
+	uintptr_t offset;
+	GLsizei count;
+	GLenum type;
+	unsigned long lowest, highest;
+	unsigned int built, checked;
+} normal_ranges[NORMAL_RANGES];
+
+static struct
+{
+	unsigned long draws, copies, copied, streamed, flat, bytes, other, stale, further;
+} normals_counts;
+
+static GLshort *normals_scratch;
+static unsigned long normals_scratch_vertices;
+
+static GLshort *normals_scratch_get(unsigned long vertices)
+{
+	if (vertices > normals_scratch_vertices)
+	{
+		GLshort *grown = realloc(normals_scratch, vertices * 4 * sizeof(GLshort));
+
+		if (!grown)
+			return NULL;
+		normals_scratch = grown;
+		normals_scratch_vertices = vertices;
+	}
+	return normals_scratch;
+}
+
+/* every normal straight up, for 65536 vertices: a draw whose copy could not
+be made */
+static GLuint normals_flat_buffer(void)
+{
+	static GLuint gpu;
+
+	if (!gpu)
+	{
+		GLshort *flat = malloc(65536 * 4 * sizeof(GLshort));
+		unsigned long vertex;
+
+		if (!flat)
+			return 0;
+		for (vertex = 0; vertex < 65536; vertex++)
+		{
+			flat[vertex * 4] = flat[vertex * 4 + 1] = 0;
+			flat[vertex * 4 + 2] = flat[vertex * 4 + 3] = 32767;
+		}
+		real_GenBuffers(1, &gpu);
+		real.BindBuffer(GL_ARRAY_BUFFER, gpu);
+		real_BufferData(GL_ARRAY_BUFFER, 65536 * 4 * sizeof(GLshort), flat, GL_STATIC_DRAW);
+		free(flat);
+		normals_counts.bytes += 65536 * 4 * sizeof(GLshort);
+	}
+	return gpu;
+}
+
+/* an indexed draw's lowest and highest index, kept for indices in the
+mirror */
+static void normals_index_range(GLenum type, const void *indices, GLsizei count, GLuint element_buffer,
+	const void *offset, unsigned long *lowest, unsigned long *highest)
+{
+	const struct layer_buffer *elements = buffer_get(element_buffer);
+	struct normal_range *range;
+	unsigned long bytes = (unsigned long)count * (type == GL_UNSIGNED_BYTE ? 1 : type == GL_UNSIGNED_SHORT ? 2 : 4);
+
+	if (!elements || !elements->pages)
+	{
+		index_range(type, indices, count, lowest, highest);
+		return;
+	}
+	range = &normal_ranges[normals_hash((uintptr_t)offset, element_buffer, (unsigned long)count) % NORMAL_RANGES];
+	if (range->buffer == element_buffer && range->offset == (uintptr_t)offset && range->count == count &&
+		range->type == type && (range->checked == upload_generation ||
+		buffer_pages_unchanged(elements, (uintptr_t)offset, (uintptr_t)offset + bytes, range->built)))
+	{
+		range->checked = upload_generation;
+		*lowest = range->lowest;
+		*highest = range->highest;
+		return;
+	}
+	index_range(type, indices, count, lowest, highest);
+	range->buffer = element_buffer;
+	range->offset = (uintptr_t)offset;
+	range->count = count;
+	range->type = type;
+	range->lowest = *lowest;
+	range->highest = *highest;
+	range->built = range->checked = upload_generation;
+}
+
+/* the copy of a mirror stream's normals, vertices 0 to highest: its GPU
+buffer, or 0 */
+static GLuint normals_stream(const struct layer_attribute *attribute, const struct layer_buffer *buffer,
+	unsigned long highest)
+{
+	uintptr_t pointer = (uintptr_t)attribute->pointer;
+	unsigned long slot = normals_hash(pointer, attribute->buffer, (unsigned long)attribute->stride) % NORMAL_STREAMS;
+	struct normal_stream *stream = NULL;
+	unsigned long vertices = highest + 1;
+	int same, probe;
+	GLshort *copy;
+
+	/* (four ways: the stream's own, else an empty one, else the one drawn
+	least lately) */
+	for (probe = 0; probe < 4 && !stream; probe++)
+	{
+		struct normal_stream *way = &normal_streams[(slot + (unsigned long)probe) % NORMAL_STREAMS];
+
+		if (way->gpu && way->buffer == attribute->buffer && way->pointer == pointer &&
+			way->stride == attribute->stride)
+		{
+			stream = way;
+		}
+	}
+	for (probe = 0; probe < 4 && !stream; probe++)
+	{
+		struct normal_stream *way = &normal_streams[(slot + (unsigned long)probe) % NORMAL_STREAMS];
+
+		if (!way->gpu)
+			stream = way;
+	}
+	if (!stream)
+	{
+		stream = &normal_streams[slot];
+		for (probe = 1; probe < 4; probe++)
+		{
+			struct normal_stream *way = &normal_streams[(slot + (unsigned long)probe) % NORMAL_STREAMS];
+
+			if (way->used < stream->used)
+				stream = way;
+		}
+	}
+	stream->used = draws_total;
+	same = stream->gpu && stream->buffer == attribute->buffer && stream->pointer == pointer &&
+		stream->stride == attribute->stride;
+
+	if (same && vertices <= stream->vertices && (stream->checked == upload_generation ||
+		buffer_pages_unchanged(buffer, pointer, pointer + (stream->vertices - 1) * (unsigned long)attribute->stride + 4,
+		stream->built)))
+	{
+		stream->checked = upload_generation;
+		return stream->gpu;
+	}
+	/* (the same stream again, further: as far as either) */
+	if (same && stream->vertices > vertices)
+		vertices = stream->vertices;
+	if (!same)
+		normals_counts.other++;
+	else if (vertices > stream->vertices)
+		normals_counts.further++;
+	else
+		normals_counts.stale++;
+	if (pointer + (vertices - 1) * (unsigned long)attribute->stride + 4 > (unsigned long)buffer->size)
+		return 0;
+	copy = normals_scratch_get(vertices);
+	if (!copy)
+		return 0;
+	normals_unpack(buffer->data + pointer, attribute->stride, 0, vertices - 1, copy);
+	if (!stream->gpu)
+		real_GenBuffers(1, &stream->gpu);
+	else
+		normals_counts.bytes -= stream->vertices * 4 * sizeof(GLshort);
+	if (!stream->gpu)
+		return 0;
+	real.BindBuffer(GL_ARRAY_BUFFER, stream->gpu);
+	real_BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertices * 4 * sizeof(GLshort)), copy, GL_STATIC_DRAW);
+	normals_counts.bytes += vertices * 4 * sizeof(GLshort);
+	normals_counts.copies++;
+	normals_counts.copied += vertices;
+	stream->buffer = attribute->buffer;
+	stream->pointer = pointer;
+	stream->stride = attribute->stride;
+	stream->vertices = vertices;
+	stream->built = stream->checked = upload_generation;
+	return stream->gpu;
+}
+
+/* the attributes a program reads, a bit each (with bit 31 for known; 0
+again when it is linked) */
+static unsigned int program_attributes[LAYER_TRACKED];
+
+static unsigned int program_reads(GLuint program)
+{
+	static void (GL_APIENTRY *get_active)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, GLchar *);
+	static GLint (GL_APIENTRY *get_location)(GLuint, const GLchar *);
+	GLint count = 0, index;
+	unsigned int used = 1u << 31;
+
+	if (!program || program >= LAYER_TRACKED)
+		return ~0u;
+	if (program_attributes[program])
+		return program_attributes[program];
+	if (!get_active)
+	{
+		get_active = (__typeof__(get_active))SDL_GL_GetProcAddress("glGetActiveAttrib");
+		get_location = (__typeof__(get_location))SDL_GL_GetProcAddress("glGetAttribLocation");
+	}
+	if (!get_active || !get_location)
+		return ~0u;
+	halo_glGetProgramiv(program, GL_ACTIVE_ATTRIBUTES, &count);
+	for (index = 0; index < count; index++)
+	{
+		char name[64];
+		GLint size;
+		GLenum type;
+		GLint location;
+
+		get_active(program, (GLuint)index, sizeof(name), NULL, &size, &type, name);
+		location = get_location(program, name);
+		if (location >= 0 && location < 31)
+			used |= 1u << location;
+	}
+	program_attributes[program] = used;
+	return used;
+}
+
+/* points each packed normal attribute of the draw (vertices lowest to
+highest) that its program reads at its copy; the others at the renderer's
+own vertices, as before (the GPU fetches every enabled attribute, and the
+copies are buffers of their own) */
+static void normals_apply(unsigned long lowest, unsigned long highest)
+{
+	struct layer_vertex_array *array = vertex_array();
+	unsigned int packed = array->packed & array->enabled;
+	unsigned int reads;
+	GLuint index;
+
+	if (normals_flat())
+		return;
+	reads = program_reads(program_current);
+	for (index = 0; packed && index < LAYER_ATTRIBUTES; index++)
+	{
+		const struct layer_attribute *attribute = &array->attributes[index];
+		const struct layer_buffer *buffer;
+		GLuint gpu = 0;
+		const void *pointer = NULL;
+
+		if (!(packed & (1u << index)))
+			continue;
+		packed &= ~(1u << index);
+		if (!(reads & (1u << index)))
+		{
+			if (normals_applied[index].gpu != ~0u)
+			{
+				attribute_point(index, attribute);
+				normals_applied[index].gpu = ~0u;
+				normals_applied[index].pointer = NULL;
+			}
+			continue;
+		}
+		normals_counts.draws++;
+		buffer = buffer_get(attribute->buffer);
+		if (highest < lowest)
+		{
+		}
+		else if (buffer && buffer->gpu && buffer->pages && buffer->data)
+		{
+			gpu = normals_stream(attribute, buffer, highest);
+		}
+		else
+		{
+			const unsigned char *source = buffer_pointer(attribute->buffer, attribute->pointer);
+			GLshort *copy = source && highest - lowest < 65536 ? normals_scratch_get(highest - lowest + 1) : NULL;
+
+			if (copy)
+			{
+				normals_unpack(source, attribute->stride, lowest, highest, copy);
+				pointer = copy - lowest * 4;
+				normals_counts.streamed += highest - lowest + 1;
+			}
+		}
+		if (!gpu && !pointer)
+		{
+			gpu = highest < 65536 ? normals_flat_buffer() : 0;
+			normals_counts.flat++;
+			if (!gpu)
+				continue;
+		}
+		/* (a client copy is the scratch, rewritten each draw: given again
+		each time) */
+		if (gpu && normals_applied[index].gpu == gpu)
+			continue;
+		normals_applied[index].gpu = gpu;
+		normals_applied[index].pointer = pointer;
+		counts.pointers++;
+		merge_changed_pointers = 1;
+		real.BindBuffer(GL_ARRAY_BUFFER, gpu);
+		real.VertexAttribPointer(index, 4, GL_SHORT, GL_TRUE, 4 * sizeof(GLshort), gpu ? NULL : pointer);
+	}
+}
+
+/* every 300 frames, with HALO_GLES2_NORMALS_LOG */
+static void normals_frame(void)
+{
+	static unsigned long frames;
+	static int logging = -1;
+
+	if (logging < 0)
+		logging = getenv("HALO_GLES2_NORMALS_LOG") != NULL;
+	if (!logging || ++frames % 300)
+		return;
+	platform_log("gles2 normals: %lu draws a frame, %lu copies made (%lu vertices), %lu streamed vertices a frame, "
+		"%lu flat draws a frame, %lu KB of copies; copies for another stream %lu, stale %lu, further %lu",
+		normals_counts.draws / 300, normals_counts.copies,
+		normals_counts.copied, normals_counts.streamed / 300, normals_counts.flat / 300, normals_counts.bytes / 1024,
+		normals_counts.other, normals_counts.stale, normals_counts.further);
+	normals_counts.other = normals_counts.stale = normals_counts.further = 0;
+	normals_counts.draws = normals_counts.copies = normals_counts.copied = normals_counts.streamed = 0;
+	normals_counts.flat = 0;
+}
+
+static void twin_draw_begin(void);
+
 static void GL_APIENTRY layer_DrawArrays(GLenum mode, GLint first, GLsizei count)
 {
+	twin_draw_begin();
 	program_ready(program_current);
 	merge_stats_draw(program_current);
 	counts.draws++;
@@ -1876,8 +2372,11 @@ static void GL_APIENTRY layer_DrawArrays(GLenum mode, GLint first, GLsizei count
 	if (tracing())
 		trace("draw arrays mode %u count %d program %u", (unsigned)mode, (int)count, program_current);
 	border_uniforms_apply();
+	position_uniforms_apply();
 	if (count > 0 && first >= 0 && bones_window_needed())
 		bones_window_apply((unsigned long)first, (unsigned long)first + (unsigned long)count - 1);
+	if (count > 0 && first >= 0 && (vertex_array()->packed & vertex_array()->enabled))
+		normals_apply((unsigned long)first, (unsigned long)first + (unsigned long)count - 1);
 	{
 		unsigned int feedback = feedback_begin();
 		unsigned int experiment = experiment_begin();
@@ -1941,6 +2440,9 @@ static struct
 	Uint64 ns;
 } draw_times[DRAW_TIME_PROGRAMS];
 static int draw_timing = -1;
+/* (tentative: defined with the programs, below) */
+static GLuint program_vertex_shaders[LAYER_TRACKED];
+static GLuint program_fragment_shaders[LAYER_TRACKED];
 
 static void draw_times_frame(void)
 {
@@ -1968,10 +2470,11 @@ static void draw_times_frame(void)
 		}
 		if (best < 0)
 			break;
-		platform_log("gles2 draw times: program %d: %.2f ms a frame, %.1f draws (%.1f from client indices), %.0f indices, %.0f us a draw",
+		platform_log("gles2 draw times: program %d: %.2f ms a frame, %.1f draws (%.1f from client indices), %.0f indices, %.0f us a draw (shaders %u and %u)",
 			best, (double)draw_times[best].ns / 300.0e6, (double)draw_times[best].draws / 300.0,
 			(double)draw_times[best].client / 300.0, (double)draw_times[best].indices / 300.0,
-			(double)draw_times[best].ns / 1000.0 / (double)draw_times[best].draws);
+			(double)draw_times[best].ns / 1000.0 / (double)draw_times[best].draws, program_vertex_shaders[best],
+			program_fragment_shaders[best]);
 		draw_times[best].ns = 0;
 	}
 	memset(draw_times, 0, sizeof(draw_times));
@@ -2047,6 +2550,7 @@ static void draw_log_frame_end(void)
 
 static void GL_APIENTRY layer_DrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
+	twin_draw_begin();
 	program_ready(program_current);
 	merge_stats_draw(program_current);
 	counts.draws++;
@@ -2074,12 +2578,20 @@ static void GL_APIENTRY layer_DrawElements(GLenum mode, GLsizei count, GLenum ty
 	indices = buffer_pointer(vertex_array()->element_buffer, indices);
 	skin_log(count, type, indices);
 	border_uniforms_apply();
+	position_uniforms_apply();
 	if (indices && count > 0 && bones_window_needed())
 	{
 		unsigned long lowest, highest;
 
 		index_range(type, indices, count, &lowest, &highest);
 		bones_window_apply(lowest, highest);
+	}
+	if (indices && count > 0 && (vertex_array()->packed & vertex_array()->enabled))
+	{
+		unsigned long lowest, highest;
+
+		normals_index_range(type, indices, count, vertex_array()->element_buffer, offset, &lowest, &highest);
+		normals_apply(lowest, highest);
 	}
 	if (indices)
 	{
@@ -2570,6 +3082,8 @@ static void GL_APIENTRY layer_BlitFramebuffer(GLint source_x0, GLint source_y0, 
 		perf_ab(timed, now - last);
 	draw_times_frame();
 	draw_log_frame_end();
+	normals_frame();
+	twin_frame();
 		last = now;
 		screenshot_maybe(destination_x0 < destination_x1 ? destination_x0 : destination_x1,
 			destination_y0 < destination_y1 ? destination_y0 : destination_y1, abs(destination_x1 - destination_x0),
@@ -2734,6 +3248,7 @@ static void GL_APIENTRY layer_CopyBufferSubData(GLenum read_target, GLenum write
 		return;
 	}
 	memmove(to->data + write_offset, from->data + read_offset, (size_t)size);
+	buffer_pages_uploaded(to, write_offset, size);
 }
 
 static void GL_APIENTRY layer_BindBufferBase(GLenum target, GLuint index, GLuint buffer)
@@ -3411,7 +3926,7 @@ static void attributes_prune(struct layer_shader *shader, struct text *source)
 			snprintf(attribute, sizeof(attribute), "v%d%s", reg, suffixes[kind]);
 			if (!word_count(source->buffer, attribute))
 				continue;
-			snprintf(declaration, sizeof(declaration), "attribute %s %s;\n", kind ? "float" : "vec4", attribute);
+			snprintf(declaration, sizeof(declaration), "attribute vec4 %s;\n", attribute);
 			at = strstr(source->buffer, declaration);
 			if (!at)
 				continue;
@@ -3425,7 +3940,7 @@ static void attributes_prune(struct layer_shader *shader, struct text *source)
 			*source = pruned;
 			memset(&pruned, 0, sizeof(pruned));
 			pairs[0] = attribute;
-			pairs[1] = kind ? "0.0" : "vec4(0.0, 0.0, 0.0, 1.0)";
+			pairs[1] = kind ? "vec4(0.0, 0.0, 1.0, 1.0)" : "vec4(0.0, 0.0, 0.0, 1.0)";
 			replace_words(&pruned, source->buffer, source->length, pairs);
 			free(source->buffer);
 			*source = pruned;
@@ -3442,10 +3957,14 @@ static void attributes_prune(struct layer_shader *shader, struct text *source)
 	}
 }
 
-/* D3DVSDT_NORMPACKED3, unpacked with bit shifts: in ES 1.00, which has none
-and no integer attributes, every such normal straight up (the models'
-lighting is off; the skinned shaders have no room to do it in floats) */
-#define NORMPACKED3_UNPACK "vec4 unpack_normpacked3(float p) { return vec4(0.0, 0.0, 1.0, 1.0); }\n"
+/* D3DVSDT_NORMPACKED3, unpacked with bit shifts: ES 1.00 has none and no
+integer attributes, and the skinned shaders no room to do it in floats. The
+attribute is the layer's copy of them as normalized shorts (normals_apply),
+passed on as it is; a program that does not link so, or
+HALO_GLES2_FLAT_NORMALS, has every such normal straight up
+(normals_flatten) */
+#define NORMPACKED3_UNPACK "vec4 unpack_normpacked3(vec4 p) { return p; }\n"
+#define NORMPACKED3_FLAT "vec4 unpack_normpacked3(vec4 p) { return vec4(0.0, 0.0, 1.0, 1.0); }\n"
 
 /* a skinned shader's node indices, as the renderer's model shaders take
 them: "(v<n>.xyzw) * (c_<k>.wwww)" a little before its first
@@ -3522,7 +4041,7 @@ static char *shader_translate(struct layer_shader *shader, const char *source)
 		}
 		else if (starts_with(text, "vec4 unpack_normpacked3("))
 		{
-			text_add(&body, NORMPACKED3_UNPACK);
+			text_add(&body, normals_flat() ? NORMPACKED3_FLAT : NORMPACKED3_UNPACK);
 			skipping = !memchr(text, '}', length - (size_t)(text - line));
 		}
 		else if (starts_with(text, "vec4 nv2a_finite("))
@@ -3574,7 +4093,16 @@ static char *shader_translate(struct layer_shader *shader, const char *source)
 			if (starts_with(text, "in ") && strchr(text, ';') && !strchr(text, '('))
 			{
 				text_add(&body, fragment ? "varying " : "attribute ");
-				replace_words(&body, text + 3, strlen(text + 3), words);
+				declaration_name(text + 3, name, sizeof(name));
+				/* (a packed normal: its copy, four normalized shorts) */
+				if (!fragment && strlen(name) > 7 && !strcmp(name + strlen(name) - 7, "_packed"))
+				{
+					text_add(&body, "vec4 ");
+					text_add(&body, name);
+					text_add(&body, ";");
+				}
+				else
+					replace_words(&body, text + 3, strlen(text + 3), words);
 				text_add(&body, "\n");
 				if (!fragment && shader->attribute_count < LAYER_ATTRIBUTES && location >= 0)
 				{
@@ -3727,6 +4255,21 @@ static void GL_APIENTRY layer_ShaderSource(GLuint shader, GLsizei count, const G
 		const GLchar *text = translated;
 
 		real.ShaderSource(shader, 1, &text, NULL);
+		/* (HALO_GLES2_DUMP_ALL: as given, deferred or not) */
+		if (getenv("HALO_GLES2_DUMP_ALL"))
+		{
+			char path[512];
+			FILE *file;
+
+			snprintf(path, sizeof(path), "%s/source%u.%s", getenv("HALO_GLES2_DUMP_ALL"), shader,
+				shaders[shader].type == GL_VERTEX_SHADER ? "vert" : "frag");
+			file = fopen(path, "w");
+			if (file)
+			{
+				fputs(translated, file);
+				fclose(file);
+			}
+		}
 	}
 }
 
@@ -4282,9 +4825,15 @@ static void GL_APIENTRY layer_GetProgramiv(GLuint program, GLenum pname, GLint *
 	real_GetProgramiv(program, pname, params);
 }
 
+static GLint twin_uniform(GLint location, int kind, const GLfloat *values, GLint integer);
+static void twin_forget(GLuint program);
+
 static void GL_APIENTRY layer_Uniform1i(GLint location, GLint value)
 {
-	struct lazy_program *lazy = lazy_pending(program_current);
+	struct lazy_program *lazy;
+
+	location = twin_uniform(location, 1, NULL, value);
+	lazy = lazy_pending(program_current);
 
 	/* (a sampler's unit, given when the program is adopted: kept) */
 	if (lazy && location >= LAZY_LOCATION && location < LAZY_LOCATION + lazy->count)
@@ -4300,14 +4849,18 @@ static void GL_APIENTRY layer_Uniform1i(GLint location, GLint value)
 
 static void GL_APIENTRY layer_Uniform1f(GLint location, GLfloat x)
 {
-	location = lazy_location(location);
+	GLfloat values[4] = { x, 0.0f, 0.0f, 0.0f };
+
+	location = lazy_location(twin_uniform(location, 2, values, 0));
 	if (location >= 0)
 		real_Uniform1f(location, x);
 }
 
 static void GL_APIENTRY layer_Uniform2f(GLint location, GLfloat x, GLfloat y)
 {
-	location = lazy_location(location);
+	GLfloat values[4] = { x, y, 0.0f, 0.0f };
+
+	location = lazy_location(twin_uniform(location, 3, values, 0));
 	if (location >= 0)
 		real_Uniform2f(location, x, y);
 }
@@ -4316,10 +4869,23 @@ static void GL_APIENTRY layer_LinkProgram(GLuint program)
 {
 	GLuint attached_fragment = 0;
 
+	/* (linked again: another program, its flat twin made anew if needed) */
+	if (program < LAYER_TRACKED && twins[program])
+	{
+		twin_forget(program);
+		if (program_renderer == program)
+			program_current = program;
+	}
+
 	if (program < LAYER_TRACKED && lazy_programs[program])
 	{
 		free(lazy_programs[program]);
 		lazy_programs[program] = NULL;
+	}
+	if (program < LAYER_TRACKED && position_programs[program])
+	{
+		free(position_programs[program]);
+		position_programs[program] = NULL;
 	}
 
 	if (program < LAYER_TRACKED && program_vertex_shaders[program])
@@ -4389,6 +4955,345 @@ static void GL_APIENTRY layer_LinkProgram(GLuint program)
 	program_link_finish(program, attached_fragment);
 }
 
+/* the start of the line text's at is on */
+static const char *line_of(const char *text, const char *at)
+{
+	while (at > text && at[-1] != '\n')
+		at--;
+	return at;
+}
+
+/* the name a line assigns to as a whole ("\tvec4 v1r0_sum = ..."; none for
+"\tr0.a = ..."), in name: whether it assigns one */
+static int line_target(const char *line, char *name, size_t size)
+{
+	static const char *const types[] = { "vec4 ", "vec3 ", "vec2 ", "float " };
+	size_t index, take = 0;
+
+	while (*line == '\t' || *line == ' ')
+		line++;
+	for (index = 0; index < sizeof(types) / sizeof(*types); index++)
+	{
+		if (!strncmp(line, types[index], strlen(types[index])))
+		{
+			line += strlen(types[index]);
+			break;
+		}
+	}
+	while (is_name_character(line[take]) && take + 1 < size)
+		take++;
+	memcpy(name, line, take);
+	name[take] = 0;
+	return take && !strncmp(line + take, " = ", 3);
+}
+
+/* whether a pixel shader reads name: not where a line assigns to it (nor
+its reads of itself there, "x = clamp(x, 0.0, 1.0)"), nor on a line that
+assigns a value read nowhere itself (nv2a_psh.c's v1r0_sum where the final
+combiner takes no v1 + r0). Anything it cannot tell, a read */
+static int name_read(const char *text, const char *name, int depth)
+{
+	size_t length = strlen(name);
+	const char *at = text;
+
+	while ((at = strstr(at, name)) != NULL)
+	{
+		const char *line = line_of(text, at);
+		char target[48];
+
+		if ((at != text && is_name_character(at[-1])) || is_name_character(at[length]) ||
+			!strncmp(line, "varying ", 8))
+		{
+			at += length;
+			continue;
+		}
+		if (!line_target(line, target, sizeof(target)) || !strncmp(target, "gl_", 3) ||
+			!strcmp(target, "fragment_color") ||
+			(strcmp(target, name) && (depth >= 2 || name_read(text, target, depth + 1))))
+		{
+			return 1;
+		}
+		at += length;
+	}
+	return 0;
+}
+
+/* whether a pixel shader reads a vertex output (xD1), itself or through
+the copy it starts with ("\tvec4 v1 = xD1;") */
+static int output_read(const char *fragment, const char *output)
+{
+	const char *at = fragment;
+	size_t length = strlen(output);
+
+	while ((at = strstr(at, output)) != NULL)
+	{
+		const char *line = line_of(fragment, at);
+		char alias[16];
+
+		if ((at != fragment && is_name_character(at[-1])) || is_name_character(at[length]) ||
+			!strncmp(line, "varying ", 8))
+		{
+			at += length;
+			continue;
+		}
+		if (sscanf(line, " vec4 %15[A-Za-z0-9_] = ", alias) != 1 || !strcmp(alias, output) || at[length] != ';' ||
+			name_read(fragment, alias, 0))
+		{
+			return 1;
+		}
+		at += length;
+	}
+	return 0;
+}
+
+/* A skinned shader's node reads clamped once where a0 is set (to the first
+row of c_bones' last node), not at each read: c_bones[a0 + 1] for
+c_bones[clamp_int(a0 + 1, 0, 107)], as every read is of one of a node's
+three rows from a0. Only a row past the last node reads another, the filler
+of a vertex's unweighted second node. Whether it was done (not where a read
+is past a0 + 2) */
+static int bones_reads_clamped_once(struct text *source)
+{
+	static const char *const read = "c_bones[clamp_int(a0 + ";
+	static const char *const set = "a0 = int(floor(";
+	struct text result = { 0 };
+	const char *at;
+	char clamp_end[32], rows_last[24];
+
+	snprintf(clamp_end, sizeof(clamp_end), ", 0, %d)]", BONES_COUNT - 1);
+	snprintf(rows_last, sizeof(rows_last), "), 0, %d);", BONES_COUNT - 3);
+	for (at = source->buffer; at && (at = strstr(at, read)) != NULL; at += strlen(read))
+	{
+		char *end;
+		long row = strtol(at + strlen(read), &end, 10);
+
+		if (row < 0 || row > 2 || strncmp(end, clamp_end, strlen(clamp_end)))
+			return 0;
+	}
+	for (at = source->buffer; at && *at;)
+	{
+		const char *next_read = strstr(at, read), *next_set = strstr(at, set);
+
+		if (next_read && (!next_set || next_read < next_set))
+		{
+			char *end;
+			long row = strtol(next_read + strlen(read), &end, 10);
+			char text[32];
+
+			text_append(&result, at, (size_t)(next_read - at));
+			snprintf(text, sizeof(text), "c_bones[a0 + %ld]", row);
+			text_add(&result, text);
+			at = end + strlen(clamp_end);
+		}
+		else if (next_set)
+		{
+			/* ("a0 = int(floor(m1.x + 0.001));" as
+			"a0 = clamp_int(int(floor(m1.x + 0.001)), 0, 105);") */
+			const char *close = strstr(next_set, ");\n");
+
+			if (!close)
+			{
+				free(result.buffer);
+				return 0;
+			}
+			text_append(&result, at, (size_t)(next_set - at));
+			text_add(&result, "a0 = clamp_int(");
+			text_append(&result, next_set + 5, (size_t)(close - (next_set + 5)));
+			text_add(&result, rows_last);
+			at = close + 2;
+		}
+		else
+		{
+			text_add(&result, at);
+			break;
+		}
+	}
+	if (!result.buffer)
+		return 0;
+	free(source->buffer);
+	*source = result;
+	return 1;
+}
+
+/* A vertex shader too large for the box's compiler (with the game's
+VC_ENABLE_LTC=0: what depends only on uniforms is worked out at each
+vertex) links not and is not drawn: the skinned shaders of the
+first-person weapon and arms with their texture transforms, lights and
+fog (on damnation the assault rifle's own, which the box drew none of; on
+bloodgulch one such). Its program is linked again with a copy of the
+shader that writes none of the outputs its pixel shader does not read (xD1
+where it copies it to v1 and takes it nowhere, xB0, xB1, xT2 and xT3 where
+it has no such stage: the compiler leaves out what computes them), whose
+position, the clip space one it kept (clip_position), is scaled and offset
+by two uniforms the layer works out (position_uniforms_apply) in place of
+the screen-space conversion undone with c[58], c[59], the viewport and the
+half-pixel offset, and whose node reads are clamped once
+(bones_reads_clamped_once). Each of those uniforms is still named, where
+it is never taken, so the copy keeps them for the renderer to give.
+Whether it is linked; the copy stays attached */
+static GLint vertex_pruned_link(GLuint program)
+{
+	static const char *const outputs[] = { "xD0", "xD1", "xB0", "xB1", "xT0", "xT1", "xT2", "xT3", "xFog" };
+	static const char *const conversion_start = "\tvec3 scale = vec3(viewport_scale.x != 0.0";
+	static const char *const conversion_end = "\tif (!(abs(position.w) > 0.0))";
+	static const char *const bones_kept = "\tif (point_size < -1.0e30) gl_Position = c_bones[107];\n";
+	static void (GL_APIENTRY *detach)(GLuint, GLuint);
+	static void (GL_APIENTRY *delete_shader)(GLuint);
+	GLuint vertex = program_vertex_shaders[program], fragment = program_fragment_shaders[program], copy;
+	struct text pruned = { 0 };
+	const char *at, *end;
+	const GLchar *source;
+	size_t index;
+	int removed = 0, converted = 0;
+	GLint status = 0;
+	char names[64] = "";
+
+	if (!vertex || vertex >= LAYER_TRACKED || !fragment || fragment >= LAYER_TRACKED || !shaders[vertex].source ||
+		!shaders[fragment].source)
+	{
+		return 0;
+	}
+	if (!detach)
+		detach = (__typeof__(detach))SDL_GL_GetProcAddress("glDetachShader");
+	if (!delete_shader)
+		delete_shader = (__typeof__(delete_shader))SDL_GL_GetProcAddress("glDeleteShader");
+	if (!detach || !delete_shader)
+		return 0;
+	text_add(&pruned, shaders[vertex].source);
+	for (index = 0; pruned.buffer && index < sizeof(outputs) / sizeof(*outputs); index++)
+	{
+		char line[16];
+		struct text cut = { 0 };
+
+		if (output_read(shaders[fragment].source, outputs[index]))
+			continue;
+		snprintf(line, sizeof(line), "\n\t%s = ", outputs[index]);
+		at = strstr(pruned.buffer, line);
+		end = at ? strchr(at + 1, '\n') : NULL;
+		if (!end)
+			continue;
+		text_append(&cut, pruned.buffer, (size_t)(at - pruned.buffer));
+		text_add(&cut, end);
+		free(pruned.buffer);
+		pruned = cut;
+		removed++;
+		strcat(names, " ");
+		strcat(names, outputs[index]);
+	}
+	/* (the conversion: only where the clip space position is always kept,
+	as the screen-space shaders keep it, straight through) */
+	at = pruned.buffer ? strstr(pruned.buffer, conversion_start) : NULL;
+	end = at ? strstr(at, conversion_end) : NULL;
+	if (end && strstr(pruned.buffer, "\tclip_captured = true;\n") && strstr(pruned.buffer, "uniform vec4 c_58;\n") &&
+		strstr(pruned.buffer, "uniform vec4 c_59;\n") && strstr(pruned.buffer, "uniform float screen_offset;\n") &&
+		strstr(pruned.buffer, bones_kept))
+	{
+		static const char *const pairs[] = {
+			"uniform float screen_offset;\n",
+			"uniform float screen_offset;\nuniform vec4 layer_position_scale;\nuniform vec4 layer_position_offset;\n",
+			"\tif (point_size < -1.0e30) gl_Position = c_bones[107];\n",
+			"\tif (point_size < -1.0e30) gl_Position = c_bones[107] + viewport_scale + viewport_offset + c_58 + c_59 + "
+				"vec4(screen_offset);\n",
+			NULL,
+		};
+		struct text cut = { 0 }, declared = { 0 };
+
+		text_append(&cut, pruned.buffer, (size_t)(at - pruned.buffer));
+		text_add(&cut, "\tvec4 position = vec4(clip_position.xyz * layer_position_scale.xyz + clip_position.w * "
+			"layer_position_offset.xyz, clip_position.w);\n");
+		text_add(&cut, end);
+		replace_text(&declared, cut.buffer, pairs);
+		free(cut.buffer);
+		free(pruned.buffer);
+		pruned = declared;
+		converted = 1;
+	}
+	if (converted)
+		bones_reads_clamped_once(&pruned);
+	if ((!removed && !converted) || !pruned.buffer)
+	{
+		free(pruned.buffer);
+		return 0;
+	}
+	copy = real.CreateShader(GL_VERTEX_SHADER);
+	if (!copy)
+	{
+		free(pruned.buffer);
+		return 0;
+	}
+	source = pruned.buffer;
+	real.ShaderSource(copy, 1, &source, NULL);
+	real.CompileShader(copy);
+	counts.compiles++;
+	/* (HALO_GLES2_DUMP: the copy, in that folder) */
+	if (getenv("HALO_GLES2_DUMP"))
+	{
+		char path[512];
+		FILE *file;
+
+		snprintf(path, sizeof(path), "%s/pruned%u.vert", getenv("HALO_GLES2_DUMP"), program);
+		file = fopen(path, "w");
+		if (file)
+		{
+			fputs(pruned.buffer, file);
+			fclose(file);
+		}
+	}
+	free(pruned.buffer);
+	halo_glGetShaderiv(copy, GL_COMPILE_STATUS, &status);
+	if (status)
+	{
+		detach(program, vertex);
+		real.AttachShader(program, copy);
+		real.LinkProgram(program);
+		counts.links++;
+		halo_glGetProgramiv(program, GL_LINK_STATUS, &status);
+		if (!status)
+		{
+			detach(program, copy);
+			real.AttachShader(program, vertex);
+		}
+	}
+	/* (deleted with the program it is attached to) */
+	delete_shader(copy);
+	platform_log("gles2: a program too large to link, again without the outputs its pixel shader does not read "
+		"(%s)%s: %s", removed ? names + 1 : "none", converted ? " and with its position's conversion worked out" : "",
+		status ? "linked" : "still does not link");
+	if (status && converted)
+	{
+		position_programs[program] = calloc(1, sizeof(struct position_program));
+		if (position_programs[program])
+			position_programs[program]->scale = -2;
+	}
+	return status;
+}
+
+/* A vertex shader whose program does not link even pruned, with its packed
+normals read: compiled again with them straight up (NORMPACKED3_FLAT), as
+the layer had them all before. Whether it was */
+static int normals_flatten(GLuint vertex)
+{
+	static const char *const pairs[] = { NORMPACKED3_UNPACK, NORMPACKED3_FLAT, NULL };
+	struct text flat = { 0 };
+	const GLchar *text;
+
+	if (!vertex || vertex >= LAYER_TRACKED || !shaders[vertex].source ||
+		!strstr(shaders[vertex].source, NORMPACKED3_UNPACK))
+	{
+		return 0;
+	}
+	replace_text(&flat, shaders[vertex].source, pairs);
+	if (!flat.buffer)
+		return 0;
+	free(shaders[vertex].source);
+	shaders[vertex].source = flat.buffer;
+	text = flat.buffer;
+	real.ShaderSource(vertex, 1, &text, NULL);
+	/* (compiled by program_link, as a deferred one) */
+	shaders[vertex].deferred = 1;
+	return 1;
+}
+
 /* the link itself, and what the layer keeps of a linked program */
 static void program_link_finish(GLuint program, GLuint attached_fragment)
 {
@@ -4413,9 +5318,27 @@ static void program_link_finish(GLuint program, GLuint attached_fragment)
 			linked = program_link(program, program_vertex_shaders[program], program_fragment_shaders[program]);
 		}
 	}
+	/* (too large for the box's compiler: vertex_pruned_link) */
+	if (program < LAYER_TRACKED)
+	{
+		free(position_programs[program]);
+		position_programs[program] = NULL;
+		if (!linked)
+			linked = vertex_pruned_link(program);
+		if (!linked && normals_flatten(program_vertex_shaders[program]))
+		{
+			linked = program_link(program, program_vertex_shaders[program],
+				attached_fragment ? attached_fragment : program_fragment_shaders[program]);
+			if (!linked)
+				linked = vertex_pruned_link(program);
+			platform_log("gles2: a program that does not link with its packed normals, with them straight up: %s",
+				linked ? "linked" : "still does not link");
+		}
+	}
 	/* (a name used again is another program: its c[] is looked up anew) */
 	if (program < LAYER_TRACKED)
 	{
+		program_attributes[program] = 0;
 		free(constant_split[program]);
 		constant_split[program] = NULL;
 		border_programs[program].color = linked ? halo_glGetUniformLocation(program, "layer_border_color") + 1 : 0;
@@ -4512,7 +5435,18 @@ struct constant_split
 	int past_bones, window, window_stale;
 };
 
+static GLint uniform_location_find(GLuint program, const GLchar *name);
+static void twin_name(GLuint program, const GLchar *name, GLint location);
+
 static GLint GL_APIENTRY layer_GetUniformLocation(GLuint program, const GLchar *name)
+{
+	GLint location = uniform_location_find(program, name);
+
+	twin_name(program, name, location);
+	return location;
+}
+
+static GLint uniform_location_find(GLuint program, const GLchar *name)
 {
 
 	/* c[N], as the renderer probes c[]'s length after asking for c: the
@@ -4586,6 +5520,21 @@ static int constants_split_build(GLuint program)
 	return any;
 }
 
+/* Vivante's GPU takes away what lies at a clip-space w under about 0.04
+(found with a test triangle: w 0.02 drew 435 of its 1024 pixels, 0.01 none
+at all), as if it clipped there and not at the near plane. The first-person
+weapon's projection puts its near plane at 0.0234 (twice
+rasterizer_first_person_weapon_near_clip_distance), and the assault rifle's
+rear reaches past the camera plane: the box drew none of the part between,
+the slab from its ammunition counter down to the screen's corner. A clip
+position is homogeneous: the same one times any positive number is the
+same point, depth and perspective-correct interpolation, so c[0] to c[3],
+the only transform the shaders write oPos (and their projected texture
+coordinates, divided by their own w) with, are uploaded times this, which
+puts that edge at a 64th of the distance. The shaders read them nowhere
+else. */
+#define CLIP_SCALE 64.0f
+
 /* HALO_GLES2_CONSTANT_LOG, -1 before it is looked up */
 static int constant_log = -1;
 
@@ -4599,7 +5548,9 @@ static void GL_APIENTRY layer_Uniform4fv(GLint location, GLsizei count, const GL
 		return;
 	if (location < CONSTANTS_VIRTUAL_LOCATION || location >= CONSTANTS_VIRTUAL_LOCATION + 192)
 	{
-		location = lazy_location(location);
+		if (count != 1 && location >= 0 && program_renderer < LAYER_TRACKED && twins[program_renderer])
+			LAYER_ONCE("a skinned program's uniform array: its flat twin keeps the first of it");
+		location = lazy_location(twin_uniform(location, 4, values, 0));
 		if (location >= 0)
 			real_Uniform4fv(location, count, values);
 		return;
@@ -4642,12 +5593,78 @@ static void GL_APIENTRY layer_Uniform4fv(GLint location, GLsizei count, const GL
 	{
 		split->window_stale = 1;
 	}
-	/* and each named one */
+	/* and each named one (c[0] to c[3], the clip-space transform, scaled:
+	CLIP_SCALE) */
 	for (index = first; index < first + count; index++)
 	{
-		if (split->named[index] >= 0)
+		if (split->named[index] < 0)
+			continue;
+		if (index < 4)
+		{
+			GLfloat scaled[4];
+			int component;
+
+			for (component = 0; component < 4; component++)
+				scaled[component] = values[(index - first) * 4 + component] * CLIP_SCALE;
+			real_Uniform4fv(split->named[index], 1, scaled);
+		}
+		else
+		{
 			real_Uniform4fv(split->named[index], 1, values + (index - first) * 4);
+		}
 	}
+}
+
+/* a vertex_pruned_link program's position scale and offset, from the
+values its uniforms hold (the renderer's, as for every program): the
+screen-space conversion's c[58] and c[59] (x by the viewport's half size,
+offset to its center less half a pixel) undone by the viewport's scale and
+offset, as the shaders' own end does it */
+static void position_uniforms_apply(void)
+{
+	static const char *const names[5] = { "viewport_scale", "viewport_offset", "c_58", "c_59", "screen_offset" };
+	static void (GL_APIENTRY *get_uniform)(GLuint, GLint, GLfloat *);
+	struct position_program *position = program_current < LAYER_TRACKED ? position_programs[program_current] : NULL;
+	GLfloat values[17], scale[4], offset[4], divisor;
+	int index;
+
+	if (!position)
+		return;
+	if (!get_uniform)
+		get_uniform = (__typeof__(get_uniform))SDL_GL_GetProcAddress("glGetUniformfv");
+	if (!get_uniform)
+		return;
+	if (position->scale == -2)
+	{
+		position->scale = real_GetUniformLocation(program_current, "layer_position_scale");
+		position->offset = real_GetUniformLocation(program_current, "layer_position_offset");
+		for (index = 0; index < 5; index++)
+			position->from[index] = real_GetUniformLocation(program_current, names[index]);
+	}
+	if (position->scale < 0 || position->offset < 0)
+		return;
+	memset(values, 0, sizeof(values));
+	for (index = 0; index < 5; index++)
+	{
+		if (position->from[index] >= 0)
+			get_uniform(program_current, position->from[index], values + index * 4);
+	}
+	if (position->given && !memcmp(values, position->last, sizeof(values)))
+		return;
+	memcpy(position->last, values, sizeof(values));
+	position->given = 1;
+	for (index = 0; index < 3; index++)
+	{
+		static const GLfloat half_pixel[3] = { 0.5f, 0.5f, 0.0f };
+
+		divisor = values[index] != 0.0f ? values[index] : 1.0f;
+		scale[index] = values[8 + index] / divisor;
+		offset[index] = (values[12 + index] + half_pixel[index] + (index == 0 ? values[16] : 0.0f) - values[4 + index]) /
+			divisor;
+	}
+	scale[3] = offset[3] = 0.0f;
+	real_Uniform4fv(position->scale, 1, scale);
+	real_Uniform4fv(position->offset, 1, offset);
 }
 
 /* an attribute's component as the GPU reads it, a float */
@@ -4976,8 +5993,329 @@ static void skin_log(GLsizei count, GLenum type, const void *indices)
 	}
 }
 
+/* ---------- flat twins: the first-person models' normals in performance mode
+
+Real normals cost the first-person weapon's and arms' skinned shaders 3 to
+4 ms a frame on damnation (the normal, binormal and tangent each skinned by
+two nodes, which with every normal straight up the compiler leaves out). In
+performance mode a skinned program's draws with the first-person
+projection (draw_first_person) draw with its flat twin instead: the same
+program linked with NORMPACKED3_FLAT. The renderer knows only its own
+program: while the twin stands in for it, its uniforms (by name, from the
+renderer's own lookups) and its c[] go to the twin, and on each change of
+which one draws, the one taking over is given everything the other had.
+Quality mode, the level and every other model keep their real normals;
+HALO_GLES2_FIRST_PERSON_NORMALS keeps them in performance mode too. */
+
+#define TWIN_UNIFORMS 64
+
+struct twin
+{
+	/* the flat twin (0: not made yet), and whether it is drawing in the
+	renderer's program's place */
+	GLuint program;
+	int failed, active;
+	int count;
+	struct
+	{
+		GLint location, twin_location;
+		char name[48];
+		int kind, given;
+		GLfloat values[4];
+		GLint integer;
+	} uniforms[TWIN_UNIFORMS];
+};
+
+static unsigned char program_is_twin[LAYER_TRACKED];
+static int twin_replaying;
+/* whether performance mode is on, asked at each present (-1: not yet) */
+static int twin_performance = -1;
+long console_performance_lines(void);
+
+static int twin_wanted_mode(void)
+{
+	static int forced = -1;
+
+	if (forced < 0)
+		forced = getenv("HALO_GLES2_FIRST_PERSON_NORMALS") != NULL;
+	if (forced || normals_flat())
+		return 0;
+	if (twin_performance < 0)
+		twin_performance = console_performance_lines() != 0;
+	return twin_performance;
+}
+
+/* at each present: performance mode switches in the game */
+static void twin_frame(void)
+{
+	twin_performance = console_performance_lines() != 0;
+}
+
+/* whether the draw's c[2] and c[3] (clip z and w) put its near plane where
+the first-person weapon's projection does (0.0117 to the level's 0.0625,
+rasterizer.c's defaults: under 0.05, whichever depth range the projection
+has) */
+static int draw_first_person(void)
+{
+	const struct constant_split *split = program_current < LAYER_TRACKED ? constant_split[program_current] : NULL;
+	const GLfloat *z, *w;
+	GLfloat a, b, near;
+	int axis = 0, index;
+
+	if (!split)
+		return 0;
+	z = split->kept[2];
+	w = split->kept[3];
+	for (index = 1; index < 3; index++)
+	{
+		if (fabsf(w[index]) > fabsf(w[axis]))
+			axis = index;
+	}
+	if (fabsf(w[axis]) < 1.0e-6f)
+		return 0;
+	a = z[axis] / w[axis];
+	if (fabsf(a) < 1.0e-6f)
+		return 0;
+	b = z[3] - a * w[3];
+	near = -b / a;
+	if (getenv("HALO_GLES2_NORMALS_LOG"))
+	{
+		static GLfloat seen[8];
+		static int seen_count;
+		int known = 0;
+
+		for (index = 0; index < seen_count; index++)
+			known |= fabsf(seen[index] - near) < 0.001f;
+		if (!known && seen_count < 8)
+		{
+			seen[seen_count++] = near;
+			platform_log("gles2 normals: a skinned draw's near plane %g (%s)", near,
+				near > 0.0f && near < 0.05f ? "first person" : "not first person");
+		}
+	}
+	return near > 0.0f && near < 0.05f;
+}
+
+/* a renderer's location of a skinned program, by name (layer_GetUniformLocation) */
+static void twin_name(GLuint program, const GLchar *name, GLint location)
+{
+	struct twin *twin;
+	int index;
+
+	if (program >= LAYER_TRACKED || program_is_twin[program] || location < 0 ||
+		(location >= CONSTANTS_VIRTUAL_LOCATION && location < CONSTANTS_VIRTUAL_LOCATION + 192) ||
+		strlen(name) >= sizeof(twin->uniforms[0].name) || !program_relative(program))
+	{
+		return;
+	}
+	if (!twins[program])
+		twins[program] = calloc(1, sizeof(struct twin));
+	twin = twins[program];
+	if (!twin)
+		return;
+	for (index = 0; index < twin->count; index++)
+	{
+		if (twin->uniforms[index].location == location)
+			return;
+	}
+	if (twin->count >= TWIN_UNIFORMS)
+	{
+		LAYER_ONCE("a skinned program with more uniforms than its flat twin keeps");
+		return;
+	}
+	twin->uniforms[twin->count].location = location;
+	twin->uniforms[twin->count].twin_location = -2;
+	strcpy(twin->uniforms[twin->count].name, name);
+	twin->count++;
+}
+
+/* a uniform the renderer gives its current program: kept, and the twin's
+location for it while the twin draws (1: an integer, 4: up to four floats) */
+static GLint twin_uniform(GLint location, int kind, const GLfloat *values, GLint integer)
+{
+	struct twin *twin = program_renderer < LAYER_TRACKED ? twins[program_renderer] : NULL;
+	int index;
+
+	if (!twin || twin_replaying || location < 0 ||
+		(location >= CONSTANTS_VIRTUAL_LOCATION && location < CONSTANTS_VIRTUAL_LOCATION + 192))
+	{
+		return location;
+	}
+	for (index = 0; index < twin->count; index++)
+	{
+		if (twin->uniforms[index].location != location)
+			continue;
+		twin->uniforms[index].kind = kind;
+		twin->uniforms[index].given = 1;
+		twin->uniforms[index].integer = integer;
+		if (values)
+			memcpy(twin->uniforms[index].values, values, sizeof(twin->uniforms[index].values));
+		if (!twin->active || !twin->program)
+			return location;
+		if (twin->uniforms[index].twin_location == -2)
+			twin->uniforms[index].twin_location = layer_GetUniformLocation(twin->program, twin->uniforms[index].name);
+		return twin->uniforms[index].twin_location;
+	}
+	return twin->active ? -1 : location;
+}
+
+static void GL_APIENTRY layer_Uniform1i(GLint location, GLint value);
+static void GL_APIENTRY layer_Uniform1f(GLint location, GLfloat x);
+static void GL_APIENTRY layer_Uniform2f(GLint location, GLfloat x, GLfloat y);
+
+/* the flat twin of a skinned program: whether it was made */
+static int twin_build(GLuint program, struct twin *twin)
+{
+	static const char *const pairs[] = { NORMPACKED3_UNPACK, NORMPACKED3_FLAT, NULL };
+	static GLuint (GL_APIENTRY *create_program)(void);
+	GLuint vertex = program_vertex_shaders[program], fragment = program_fragment_shaders[program], flat_shader, made;
+	struct text flat = { 0 };
+	const GLchar *text;
+	GLint linked = 0;
+	GLuint current = program_current;
+
+	twin->failed = 1;
+	if (!vertex || vertex >= LAYER_TRACKED || !fragment || !shaders[vertex].source ||
+		!strstr(shaders[vertex].source, NORMPACKED3_UNPACK))
+	{
+		return 0;
+	}
+	if (!create_program)
+		create_program = (__typeof__(create_program))SDL_GL_GetProcAddress("glCreateProgram");
+	if (!create_program)
+		return 0;
+	replace_text(&flat, shaders[vertex].source, pairs);
+	if (!flat.buffer)
+		return 0;
+	flat_shader = layer_CreateShader(GL_VERTEX_SHADER);
+	if (!flat_shader || flat_shader >= LAYER_TRACKED)
+	{
+		free(flat.buffer);
+		return 0;
+	}
+	{
+		struct layer_shader copy = shaders[vertex];
+
+		copy.source = flat.buffer;
+		copy.deferred = 0;
+		shaders[flat_shader] = copy;
+	}
+	text = flat.buffer;
+	real.ShaderSource(flat_shader, 1, &text, NULL);
+	real.CompileShader(flat_shader);
+	counts.compiles++;
+	made = create_program();
+	if (!made || made >= LAYER_TRACKED)
+		return 0;
+	program_is_twin[made] = 1;
+	layer_AttachShader(made, flat_shader);
+	layer_AttachShader(made, fragment);
+	layer_LinkProgram(made);
+	program_ready(made);
+	halo_glGetProgramiv(made, GL_LINK_STATUS, &linked);
+	platform_log("gles2 normals: program %u's flat twin, for its first-person draws in performance mode: %s", program,
+		linked ? "linked" : "does not link");
+	if (!linked)
+		return 0;
+	/* (its c[] found, as the renderer's lookup of "c" does) */
+	layer_GetUniformLocation(made, "c");
+	program_current = current;
+	twin->program = made;
+	twin->failed = 0;
+	return 1;
+}
+
+/* the renderer's program or its twin made the one drawing, given all the
+other had */
+static void twin_switch(struct twin *twin, GLuint from, GLuint to, int to_twin)
+{
+	const struct constant_split *split = from < LAYER_TRACKED ? constant_split[from] : NULL;
+	int index;
+
+	program_current = to;
+	program_ready(to);
+	real.UseProgram(to);
+	twin_replaying = 1;
+	if (split)
+	{
+		GLfloat kept[192][4];
+
+		memcpy(kept, split->kept, sizeof(kept));
+		layer_Uniform4fv(CONSTANTS_VIRTUAL_LOCATION, 192, kept[0]);
+	}
+	for (index = 0; index < twin->count; index++)
+	{
+		GLint location = twin->uniforms[index].location;
+
+		if (!twin->uniforms[index].given)
+			continue;
+		if (to_twin)
+		{
+			if (twin->uniforms[index].twin_location == -2)
+				twin->uniforms[index].twin_location = layer_GetUniformLocation(to, twin->uniforms[index].name);
+			location = twin->uniforms[index].twin_location;
+		}
+		if (location < 0)
+			continue;
+		switch (twin->uniforms[index].kind)
+		{
+		case 1: layer_Uniform1i(location, twin->uniforms[index].integer); break;
+		case 2: layer_Uniform1f(location, twin->uniforms[index].values[0]); break;
+		case 3: layer_Uniform2f(location, twin->uniforms[index].values[0], twin->uniforms[index].values[1]); break;
+		case 4: layer_Uniform4fv(location, 1, twin->uniforms[index].values); break;
+		default: break;
+		}
+	}
+	twin_replaying = 0;
+	twin->active = to_twin;
+}
+
+/* before each draw: the renderer's skinned program or its flat twin, as the
+draw wants */
+static void twin_draw_begin(void)
+{
+	struct twin *twin = program_renderer && program_renderer < LAYER_TRACKED ? twins[program_renderer] : NULL;
+	int want;
+
+	if (!twin || (!twin->active && !twin_wanted_mode()))
+		return;
+	program_ready(program_current);
+	want = twin_wanted_mode() && draw_first_person();
+	if (want == twin->active)
+		return;
+	if (want && !twin->program && (twin->failed || !twin_build(program_renderer, twin)))
+		return;
+	if (want)
+		twin_switch(twin, program_renderer, twin->program, 1);
+	else
+		twin_switch(twin, twin->program, program_renderer, 0);
+}
+
+/* a program linked again is another: its twin forgotten */
+static void twin_forget(GLuint program)
+{
+	static void (GL_APIENTRY *delete_program)(GLuint);
+
+	if (program >= LAYER_TRACKED || !twins[program])
+		return;
+	if (twins[program]->program)
+	{
+		if (!delete_program)
+			delete_program = (__typeof__(delete_program))SDL_GL_GetProcAddress("glDeleteProgram");
+		if (delete_program)
+			delete_program(twins[program]->program);
+		program_is_twin[twins[program]->program] = 0;
+	}
+	free(twins[program]);
+	twins[program] = NULL;
+}
+
 static void GL_APIENTRY layer_UseProgram(GLuint program)
 {
+	program_renderer = program;
+	/* (its flat twin, while that draws in its place) */
+	if (program < LAYER_TRACKED && twins[program] && twins[program]->active && twins[program]->program)
+		program = twins[program]->program;
 	program_current = program;
 	counts.programs++;
 	if (!lazy_pending(program))

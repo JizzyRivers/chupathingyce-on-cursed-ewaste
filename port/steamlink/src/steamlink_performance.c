@@ -61,6 +61,9 @@ boolean console_performance_object_transparents(void);
 boolean console_performance_sky(void);
 real console_performance_decoration_distance(void);
 boolean console_performance_hud_frames(void);
+boolean console_performance_sorted_objects(void);
+boolean console_performance_one_reflection_permutation(void);
+int d3d8_gl_flipped_off(void);
 
 static struct
 {
@@ -176,6 +179,29 @@ boolean console_performance_fused_level_passes(void)
 		!rasterizer_debug_options.draw_environment_diffuse_lights &&
 		rasterizer_debug_options.draw_environment_lightmaps && rasterizer_debug_options.draw_environment_textures &&
 		rasterizer_debug_options.drawing_mode == 0;
+}
+
+/* whether the objects' opaque draws are drawn grouped by their programs
+(render.c, d3d8_gl.c's sorted passes): a change of program is most of what
+a draw costs the driver, and an object's parts change it at each part.
+HALO_GLES2_NO_SORT draws them as they come. */
+boolean console_performance_sorted_objects(void)
+{
+	return performance_cutting();
+}
+
+/* whether a model's environment-shaded part with one node and no cube map
+is drawn with the reflection vertex shader (rasterizer_xbox_models.c), as
+the parts with a cube map are, rather than its one-node one: the two share
+their pixel shader, and an object whose parts take turns at the two changed
+program at each part. HALO_NO_ONE_NODE_UNIFY: each its own. */
+boolean console_performance_one_reflection_permutation(void)
+{
+	static int allowed = -1;
+
+	if (allowed < 0)
+		allowed = !getenv("HALO_NO_ONE_NODE_UNIFY");
+	return allowed && performance_cutting() && !d3d8_gl_flipped_off();
 }
 
 /* what a model's size on the screen is multiplied by when its detail is
