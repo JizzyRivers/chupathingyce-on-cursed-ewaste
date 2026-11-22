@@ -137,7 +137,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static final int SCENE_KNOWN = 1, SCENE_MENUS = 2, SCENE_ON = 4, SCENE_OFF = 8;
     private int scene;
     private final InputManager inputManager;
-    private final boolean touchscreenFeature;
+    private final boolean touchscreenFeature, television;
     private boolean controllerConnected, touchscreen;
 
     public TouchControls(Context context) {
@@ -154,7 +154,11 @@ public final class TouchControls extends View implements SensorEventListener, In
             vibrator = manager == null ? null : manager.getDefaultVibrator();
         } else vibrator = (Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE);
         inputManager = (InputManager) context.getSystemService(Context.INPUT_SERVICE);
-        touchscreenFeature = context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN);
+        // (a television's box can claim a touchscreen of its remote's: its UI mode says what it is)
+        android.app.UiModeManager uiMode = (android.app.UiModeManager) context.getSystemService(Context.UI_MODE_SERVICE);
+        television = uiMode != null
+            && uiMode.getCurrentModeType() == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION;
+        touchscreenFeature = !television && context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN);
         refreshInputDevices();
         preferences = context.getSharedPreferences("touch-layout-v1", Context.MODE_PRIVATE);
         String configuration = preferences.getString("configuration", null);
@@ -306,7 +310,7 @@ public final class TouchControls extends View implements SensorEventListener, In
             InputDevice device = InputDevice.getDevice(id);
             if (device == null) continue;
             if (isController(device)) controller = true;
-            if (!device.isVirtual() && (device.getSources() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN)
+            if (!television && !device.isVirtual() && (device.getSources() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN)
                 touch = true;
         }
         boolean wasShown = shown();

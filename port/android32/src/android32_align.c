@@ -22,6 +22,7 @@ costs a signal: the game's hottest sites are worth fixing in the source.
 */
 
 #include <android/log.h>
+#include <dlfcn.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
@@ -214,6 +215,56 @@ static int emulate_vfp(ucontext_t *context, unsigned long *registers, uint32_t i
 	return 1;
 }
 
+
+/* which instructions fault, by address: the hottest are logged now and then (a report is worth fixing
+in the source, as each costs a signal) */
+#define SITES 512
+static struct { uint32_t pc; unsigned long count; } sites[SITES];
+
+static void site_note(uint32_t pc)
+{
+	unsigned index = (pc >> 2) % SITES, tries;
+
+	for (tries = 0; tries < SITES; tries++, index = (index + 1) % SITES)
+	{
+		if (sites[index].pc == pc || !sites[index].count)
+		{
+			sites[index].pc = pc;
+			sites[index].count++;
+			return;
+		}
+	}
+}
+
+static void sites_report(void)
+{
+	int rank;
+	unsigned long total = 0;
+	unsigned index;
+	Dl_info information;
+
+	for (index = 0; index < SITES; index++)
+		total += sites[index].count;
+	for (rank = 0; rank < 12; rank++)
+	{
+		unsigned best = 0;
+
+		for (index = 1; index < SITES; index++)
+			if (sites[index].count > sites[best].count)
+				best = index;
+		if (!sites[best].count)
+			break;
+		if (dladdr((void *)(uintptr_t)sites[best].pc, &information) && information.dli_fbase)
+			__android_log_print(ANDROID_LOG_INFO, LOG_TAG, "alignment site %5.1f%% libmain+0x%lx (%lu of %lu)",
+				100.0 * (double)sites[best].count / (double)total,
+				(unsigned long)(sites[best].pc - (uint32_t)(uintptr_t)information.dli_fbase), sites[best].count, total);
+		sites[best].count = 0; /* (taken out of the next report's ranking: restored below) */
+		sites[best].pc |= 1;
+	}
+	for (index = 0; index < SITES; index++)
+		sites[index].pc &= ~1u;
+}
+
 static void alignment_fault(int signal_number, siginfo_t *information, void *argument)
 {
 	ucontext_t *context = (ucontext_t *)argument;
@@ -234,6 +285,10 @@ static void alignment_fault(int signal_number, siginfo_t *information, void *arg
 		if (handled)
 		{
 			unsigned long count = ++fixed_count;
+
+			site_note(pc);
+			if (count % 200000 == 0)
+				sites_report();
 
 			if (!branched)
 				registers[15] = pc + 4;

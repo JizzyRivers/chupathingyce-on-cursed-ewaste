@@ -18,7 +18,11 @@ def main():
     shutil.rmtree(BUILD / "stage", ignore_errors=True)
     OUT.mkdir(parents=True)
     libmain = ROOT / "chupathingyce" / "build" / "android32" / "jniLibs" / "armeabi-v7a" / "libmain.so"
-    subprocess.run([str(strip), "--strip-unneeded", "-o", str(OUT / "libmain.so"), str(libmain)], check=True)
+    if os.environ.get("ANDROID32_KEEP_SYMBOLS"):
+        # (for simpleperf on the device: the functions' names)
+        shutil.copy2(libmain, OUT / "libmain.so")
+    else:
+        subprocess.run([str(strip), "--strip-unneeded", "-o", str(OUT / "libmain.so"), str(libmain)], check=True)
     subprocess.run([str(strip), "--strip-unneeded", "-o", str(OUT / "libSDL3.so"), str(BUILD / "sdl3-build" / "libSDL3.so")],
                    check=True)
     for library in sorted(OUT.iterdir()):
