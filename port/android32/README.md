@@ -17,7 +17,10 @@ Tested: Amlogic S905W2 (Mali-G31, ES 3.2): Blood Gulch at about 40 fps; Echo Sho
    `XisoExtractor`, upstream's reader) or **Choose a folder with the maps** (the Xbox's maps, with
    `ui.map`, from a computer or a USB drive; copied `ui.map` first and then the smallest maps first as far
    as the free space goes, so a device with 1.5 GB left still gets the multiplayer maps). Both use the
-   system's file picker, which opens in Downloads. Or copy them by hand, which the screen also says:
+   system's file picker, which opens in Downloads. A box with no file picker (the S905W2 has none) lists any
+   disc image (.iso, .xiso) it finds in the app's own folder (`.../files/`, and the same on a USB drive), as
+   a button: copy one there (adb, a file manager) and press "check again". The whole set with the movies is
+   2.4 GB. Or copy the maps by hand, which the screen also says:
    `adb push maps /sdcard/Android/data/dev.warman.chupathingyce32/files/`, then "check again".
 3. A gamepad works as on the desktop. A device with a touchscreen gets the
    on-screen controls (upstream's overlay; a compact layout on a small wide screen); a television

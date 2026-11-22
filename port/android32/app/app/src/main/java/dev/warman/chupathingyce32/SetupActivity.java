@@ -44,8 +44,8 @@ import java.util.Locale;
 public class SetupActivity extends Activity {
     private static final int PICK_IMAGE = 1, PICK_FOLDER = 2;
     private static final int COPY_BUFFER = 1 << 20;
-    /** the maps are about 1.8 GB (the discs' whole set) */
-    private static final long SPACE_NEEDED = 2L << 30;
+    /** the maps are 1.8 GB and the movies 0.6 GB (the disc's whole set) */
+    private static final long SPACE_NEEDED = 2560L << 20;
     /** room left over after a map */
     private static final long SPACE_MARGIN = 64L << 20;
     private volatile String skippedNote;
@@ -54,6 +54,8 @@ public class SetupActivity extends Activity {
     private TextView status;
     private ProgressBar progress;
     private Button pickImage, pickFolder, recheck;
+    /** the disc images found in the app's folders (a box with no file picker uses these) */
+    private LinearLayout foundBox;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean gameStarted, working;
 
@@ -77,6 +79,8 @@ public class SetupActivity extends Activity {
         // data pushed with adb while this screen was open
         if (!gameStarted && !working && haveData())
             startGame();
+        else if (!gameStarted && !working && foundBox != null)
+            showFoundImages();
     }
 
     private boolean haveData() {
@@ -126,7 +130,7 @@ public class SetupActivity extends Activity {
         TextView message = new TextView(this);
         message.setText("Choose an Xbox disc image of Halo: Combat Evolved (an .iso or .xiso file), or a folder "
             + "that has the maps (the Xbox's, with ui.map). They are copied into the app's storage "
-            + "(about 1.8 GB); the image can be deleted afterwards.\n\n"
+            + "(about 2.4 GB with the movies); the image can be deleted afterwards.\n\n"
             + "Or copy them from a computer:  adb push maps " + (dataRoot != null ? dataRoot.getAbsolutePath() : "")
             + "/");
         message.setTextColor(Color.rgb(200, 205, 210));
@@ -149,12 +153,19 @@ public class SetupActivity extends Activity {
         pickFolder.setOnClickListener(v -> launchPicker(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), PICK_FOLDER));
         layout.addView(pickFolder);
 
+        foundBox = new LinearLayout(this);
+        foundBox.setOrientation(LinearLayout.VERTICAL);
+        foundBox.setGravity(Gravity.CENTER);
+        layout.addView(foundBox);
+
         recheck = button("I copied them: check again");
         recheck.setOnClickListener(v -> {
             if (haveData())
                 startGame();
-            else
+            else {
+                showFoundImages();
                 status.setText("maps/ui.map is not in " + dataRoot + " yet.");
+            }
         });
         layout.addView(recheck);
 
@@ -179,7 +190,62 @@ public class SetupActivity extends Activity {
         scroll.addView(layout, new ScrollView.LayoutParams(ScrollView.LayoutParams.MATCH_PARENT,
             ScrollView.LayoutParams.WRAP_CONTENT));
         setContentView(scroll);
+        showFoundImages();
         pickImage.requestFocus();
+    }
+
+
+    /**
+     * Disc images (.iso, .xiso) in the app's own folders: its files folder, and the same on a USB drive or a
+     * card. A box with no file picker (many have none) has no other way in than copying one there (adb, a file
+     * manager, a USB drive's Android/data folder).
+     */
+    private List<File> findImages() {
+        List<File> found = new ArrayList<>();
+        File[] roots = getExternalFilesDirs(null);
+
+        for (File root : roots) {
+            File[] files = root == null ? null : root.listFiles();
+            if (files == null)
+                continue;
+            for (File file : files) {
+                String name = file.getName().toLowerCase(Locale.US);
+                if (file.isFile() && (name.endsWith(".iso") || name.endsWith(".xiso")) && file.length() > (64L << 20))
+                    found.add(file);
+            }
+        }
+        return found;
+    }
+
+    private void showFoundImages() {
+        foundBox.removeAllViews();
+        for (File image : findImages()) {
+            Button use = button("Use " + image.getName() + " (" + (image.length() >> 20) + " MB)");
+            use.setOnClickListener(v -> {
+                if (dataRoot != null && dataRoot.getUsableSpace() < SPACE_NEEDED && !haveData()) {
+                    status.setText(String.format(Locale.US, "Not enough free space for the whole disc: about 2.5 GB is "
+                        + "needed, %d MB is free.", dataRoot.getUsableSpace() >> 20));
+                    return;
+                }
+                setBusy(true);
+                status.setText("Reading the disc image...");
+                new Thread(() -> importFile(image)).start();
+            });
+            foundBox.addView(use);
+        }
+    }
+
+    private void importFile(File image) {
+        try (FileInputStream in = new FileInputStream(image)) {
+            XisoExtractor.extractMaps(in.getChannel(), dataRoot, (file, done, total) ->
+                report("Copying maps/" + file + " (" + (done >> 20) + " of " + (total >> 20) + " MB)",
+                    total > 0 ? (int) (done * 1000 / total) : 0));
+            finished();
+        } catch (XisoExtractor.ExtractException exception) {
+            fail(exception.getMessage());
+        } catch (Exception exception) {
+            fail("Copying failed: " + exception.getMessage());
+        }
     }
 
     private void launchPicker(Intent intent, int request) {
@@ -194,7 +260,7 @@ public class SetupActivity extends Activity {
             startActivityForResult(intent, request);
         } catch (ActivityNotFoundException e) {
             // (some boxes have no file picker: the data goes in with adb, as the screen says)
-            status.setText("This device has no file picker. Copy the maps with adb, as above.");
+            status.setText("This device has no file picker. Put a disc image (.iso) or the maps in the app's folder, as above.");
         }
     }
 
@@ -203,6 +269,8 @@ public class SetupActivity extends Activity {
         pickImage.setEnabled(!busy);
         pickFolder.setEnabled(!busy);
         recheck.setEnabled(!busy);
+        for (int i = 0; foundBox != null && i < foundBox.getChildCount(); i++)
+            foundBox.getChildAt(i).setEnabled(!busy);
         progress.setVisibility(busy ? View.VISIBLE : View.GONE);
     }
 
@@ -214,7 +282,7 @@ public class SetupActivity extends Activity {
         Uri chosen = data.getData();
         // (a disc image is copied whole, so it needs the room; a folder's maps are copied as far as they fit)
         if (requestCode == PICK_IMAGE && dataRoot != null && dataRoot.getUsableSpace() < SPACE_NEEDED && !haveData()) {
-            status.setText(String.format(Locale.US, "Not enough free space for the whole disc: the maps need about 2 GB, "
+            status.setText(String.format(Locale.US, "Not enough free space for the whole disc: the maps need about 2.5 GB, "
                 + "%d MB is free. A folder with some of the maps (ui.map and the multiplayer ones) can be copied instead.",
                 dataRoot.getUsableSpace() >> 20));
             return;
