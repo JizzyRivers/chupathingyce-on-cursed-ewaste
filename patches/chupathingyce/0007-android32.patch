@@ -48,7 +48,7 @@ index 44b88eabe..d9e99f849 100644
  #define GL_ES_OPTIONAL_FUNCTION(name) !strcmp(#name, "glDrawElementsBaseVertex")
  #else
 diff --git a/port/linux/src/sdl_platform.c b/port/linux/src/sdl_platform.c
-index 5c8b7f753..753bb1ff8 100644
+index 5c8b7f753..d6ea15444 100644
 --- a/port/linux/src/sdl_platform.c
 +++ b/port/linux/src/sdl_platform.c
 @@ -1965,7 +1965,9 @@ BOOL platform_video_initialize(unsigned long width, unsigned long height)
@@ -62,6 +62,26 @@ index 5c8b7f753..753bb1ff8 100644
  	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
  	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
  	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+@@ -2133,6 +2135,19 @@ BOOL platform_video_initialize(unsigned long width, unsigned long height)
+ 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+ 		platform_gl_context = SDL_GL_CreateContext(platform_window);
+ 	}
++#endif
++#if defined(HALO_ANDROID32) && !defined(HALO_ANDROID)
++	/* ES 3.2 where the driver has it, then 3.1 (a Mali-T720's: the Echo Show 5), then 3.0 */
++	if (!platform_gl_context)
++	{
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
++		platform_gl_context = SDL_GL_CreateContext(platform_window);
++	}
++	if (!platform_gl_context)
++	{
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++		platform_gl_context = SDL_GL_CreateContext(platform_window);
++	}
+ #endif
+ 	if (!platform_gl_context)
+ 	{
 diff --git a/source/bitmaps/libtiff/tiffcompat.h b/source/bitmaps/libtiff/tiffcompat.h
 index d1a10aea3..84be3ea9f 100644
 --- a/source/bitmaps/libtiff/tiffcompat.h
