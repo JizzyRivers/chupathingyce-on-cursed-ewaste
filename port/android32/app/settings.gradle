@@ -1,0 +1,18 @@
+// Gradle project of the 32-bit Android port (../build.py makes libmain.so with
+// `ninja android32`, stage.py puts it and SDL3 in build/android32/stage).
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "chupathingyce-android32"
+include ":app"

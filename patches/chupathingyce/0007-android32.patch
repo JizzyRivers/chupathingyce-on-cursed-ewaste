@@ -1,0 +1,77 @@
+diff --git a/port/linux/include/halo_linux_prefix.h b/port/linux/include/halo_linux_prefix.h
+index d52f93cb2..f68819266 100644
+--- a/port/linux/include/halo_linux_prefix.h
++++ b/port/linux/include/halo_linux_prefix.h
+@@ -68,7 +68,7 @@ with -fshort-wchar and must be fixed before the host headers define theirs.
+ The 64-bit builds also need the declarations themselves: they reject an
+ implicitly declared function (its int result would truncate a pointer). */
+ 
+-#if defined(__APPLE__) || defined(HALO_64BIT)
++#if defined(__APPLE__) || defined(HALO_64BIT) || defined(__ANDROID__)
+ #ifndef __APPLE__
+ /* glibc: no extern-inline helpers (__NO_INLINE__ below; its headers are
+ read here first), and the ctype functions as functions, not macros, which
+@@ -109,6 +109,9 @@ say; the game has its own, of other types (cseries.h, real_math.h) */
+ #ifdef __ANDROID__
+ #undef strnlen
+ #undef random
++#ifdef HALO_LINUX_PLATFORM_LAYER
++extern size_t strnlen(const char *, size_t);
++#endif
+ #endif
+ #endif
+ 
+diff --git a/port/linux/include/limits.h b/port/linux/include/limits.h
+index fb4fb9c18..68a108c72 100644
+--- a/port/linux/include/limits.h
++++ b/port/linux/include/limits.h
+@@ -16,7 +16,7 @@ layer, which doesn't include cseries.h, gets 32-bit macros.
+ 
+ #include_next <limits.h>
+ 
+-#ifdef HALO_64BIT
++#if defined(HALO_64BIT) || defined(__ANDROID__)
+ #undef LONG_MAX
+ #undef LONG_MIN
+ #undef ULONG_MAX
+diff --git a/port/linux/src/gl_functions.c b/port/linux/src/gl_functions.c
+index 44b88eabe..d9e99f849 100644
+--- a/port/linux/src/gl_functions.c
++++ b/port/linux/src/gl_functions.c
+@@ -43,7 +43,7 @@ int gl_functions_load(void)
+ 		!strcmp(#name, "glVertexAttribIFormat") || !strcmp(#name, "glVertexAttribBinding") || \
+ 		!strcmp(#name, "glBindVertexBuffer") || !strcmp(#name, "glGetQueryBufferObjectuiv") || \
+ 		!strcmp(#name, "glBindTextures"))
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_ANDROID32)
+ /* ES 3.2's; on 3.0 (iOS's newest) gl_initialize does without it */
+ #define GL_ES_OPTIONAL_FUNCTION(name) !strcmp(#name, "glDrawElementsBaseVertex")
+ #else
+diff --git a/port/linux/src/sdl_platform.c b/port/linux/src/sdl_platform.c
+index 5c8b7f753..753bb1ff8 100644
+--- a/port/linux/src/sdl_platform.c
++++ b/port/linux/src/sdl_platform.c
+@@ -1965,7 +1965,9 @@ BOOL platform_video_initialize(unsigned long width, unsigned long height)
+ 	host_renderer_vulkan = xgpu_vulkan;
+ #endif
+ 
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_ANDROID32)
++	/* (HALO_ANDROID32: a 32-bit Android build whose driver is ES 3.2, built as the other consoles' ports
++	are, not as the guest build's HALO_ANDROID code paths) */
+ 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+ 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+ 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+diff --git a/source/bitmaps/libtiff/tiffcompat.h b/source/bitmaps/libtiff/tiffcompat.h
+index d1a10aea3..84be3ea9f 100644
+--- a/source/bitmaps/libtiff/tiffcompat.h
++++ b/source/bitmaps/libtiff/tiffcompat.h
+@@ -170,7 +170,7 @@ extern	long lseek();
+ #define	WriteOK(fd, buf, size)	(write(fd, (char *)buf, size) == size)
+ #endif
+ 
+-#if defined(__MACH__) || defined(THINK_C)
++#if defined(__MACH__) || defined(THINK_C) || defined(__ANDROID__)
+ extern	void *malloc(size_t size);
+ extern	void *realloc(void *ptr, size_t size);
+ #else /* !__MACH__ && !THINK_C */

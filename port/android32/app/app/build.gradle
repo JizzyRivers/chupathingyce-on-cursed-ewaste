@@ -1,0 +1,41 @@
+plugins {
+    id "com.android.application"
+}
+
+// build/android32 in the repository root: stage/jniLibs/armeabi-v7a has the
+// game's libmain.so and SDL3's libSDL3.so (stage.py); SDL3's Java side is
+// the source tree the library was built from
+def repository = new File(rootDir, "../../..")
+def staged = new File(repository, "build/android32/stage")
+def sdlJava = new File(repository, "build/android32/SDL3/android-project/app/src/main/java")
+def haloVersion = System.getenv("HALO_VERSION") ?: "0.9.1b-android32-dev"
+
+android {
+    namespace "dev.warman.chupathingyce32"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "dev.warman.chupathingyce32"
+        // 28: getrandom and the other calls bionic has from Pie
+        minSdk 28
+        targetSdk 34
+        versionCode 1
+        versionName haloVersion
+        ndk {
+            abiFilters "armeabi-v7a"
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs += sdlJava
+            jniLibs.srcDirs = [new File(staged, "jniLibs")]
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+}
