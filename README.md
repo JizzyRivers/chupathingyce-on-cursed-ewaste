@@ -1,4 +1,17 @@
-chupathingyce-steamlink
+chupathingyce-on-weird-boxes-capisce
+
+halo ce (the chupathingyce decomp, https://github.com/ChupathingyCE/chupathingyce) on hardware that has no business running it. native, not streamed. one repo, a port each. nobody touches ui.map
+
+whats in here
+- steam link: the og 2015 box, armv7 hard float, vivante gpu, gles 2 only, 263 mb of ram. port/steamlink, release v0.9.1b. campaign plays, online games work. about 23 fps on bloodgulch. all the steps r below
+- 32 bit android: boxes, tablets n smart displays whose android is 32 bit only, so upstreams 64 bit apk wont even install. my s905w2 tv box (64 bit chip, 32 bit android, lowkey a trap) does bloodgulch at about 40 fps, an echo show 5 on lineageos does about 30. port/android32, release android32-v0.9.1b. it has a tv banner, a setup screen for the disc image or the maps, touch controls n a custom edition import. install steps n what i did n didnt test r in port/android32/README.md
+- each one is the same game w its own platform layer. the game itself comes in as a submodule on an upstream tag plus a few patches in patches/chupathingyce, which go upstream once theyre ready
+
+bring ur own copy on both, same as every other chupathingyce build. theres no halo in this repo or any download, ur disc gives the game its maps
+
+the repo used to be called chupathingyce-steamlink, github sends the old links here. the steam link bits still say steamlink on purpose, the boxes in the field look for that name on warman.world
+
+steam link
 
 halo ce on the og steam link box (the 2015 one). native, not streamed. port of chupathingyce https://github.com/ChupathingyCE/chupathingyce
 

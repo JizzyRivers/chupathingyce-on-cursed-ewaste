@@ -5,3 +5,4 @@ __pycache__/
 /steamlink-sdk/
 /build/
 /steamlink/
+tools/box/shim/*.so
