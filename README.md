@@ -1,6 +1,6 @@
-chupathingyce-on-weird-boxes-capisce
+chupathingyce-on-cursed-ewaste
 
-halo ce (the chupathingyce decomp, https://github.com/ChupathingyCE/chupathingyce) on hardware that has no business running it. native, not streamed. one repo, a port each. nobody touches ui.map
+halo ce (the chupathingyce decomp, https://github.com/ChupathingyCE/chupathingyce) on hardware that has no business running it. native, not streamed. one repo, a port each
 
 whats in here
 - steam link: the og 2015 box, armv7 hard float, vivante gpu, gles 2 only, 263 mb of ram. port/steamlink, release v0.9.1b. campaign plays, online games work. about 23 fps on bloodgulch. all the steps r below
@@ -33,7 +33,7 @@ steps
 4. optional, for custom edition servers: put halocesetup_en_1.00.exe on the root of the stick too
 5. plug the stick in the steam link n power cycle it. it installs at boot
 6. run ChupathingyCE from the apps
-7. first run it copies ur maps to the stick, about 14 min, then custom edition if u added it, about 3 min, then makes its cache, about 3 min. a ring fills up n monks sing. only happens once, go eat something, capisce
+7. first run it copies ur maps to the stick, about 14 min, then custom edition if u added it, about 3 min, then makes its cache, about 3 min. a ring fills up n monks sing. only happens once, go eat something
 
 leave the stick in. maps, saves, settings n the log all live on it in chupathingyce/, the box doesnt have the room. pull it while its running n ur on ur own
 
