@@ -1,0 +1,349 @@
+diff --git a/port/linux/include/halo_linux_prefix.h b/port/linux/include/halo_linux_prefix.h
+index d52f93cb2..f68819266 100644
+--- a/port/linux/include/halo_linux_prefix.h
++++ b/port/linux/include/halo_linux_prefix.h
+@@ -68,7 +68,7 @@ with -fshort-wchar and must be fixed before the host headers define theirs.
+ The 64-bit builds also need the declarations themselves: they reject an
+ implicitly declared function (its int result would truncate a pointer). */
+ 
+-#if defined(__APPLE__) || defined(HALO_64BIT)
++#if defined(__APPLE__) || defined(HALO_64BIT) || defined(__ANDROID__)
+ #ifndef __APPLE__
+ /* glibc: no extern-inline helpers (__NO_INLINE__ below; its headers are
+ read here first), and the ctype functions as functions, not macros, which
+@@ -109,6 +109,9 @@ say; the game has its own, of other types (cseries.h, real_math.h) */
+ #ifdef __ANDROID__
+ #undef strnlen
+ #undef random
++#ifdef HALO_LINUX_PLATFORM_LAYER
++extern size_t strnlen(const char *, size_t);
++#endif
+ #endif
+ #endif
+ 
+diff --git a/port/linux/include/limits.h b/port/linux/include/limits.h
+index fb4fb9c18..68a108c72 100644
+--- a/port/linux/include/limits.h
++++ b/port/linux/include/limits.h
+@@ -16,7 +16,7 @@ layer, which doesn't include cseries.h, gets 32-bit macros.
+ 
+ #include_next <limits.h>
+ 
+-#ifdef HALO_64BIT
++#if defined(HALO_64BIT) || defined(__ANDROID__)
+ #undef LONG_MAX
+ #undef LONG_MIN
+ #undef ULONG_MAX
+diff --git a/port/linux/src/gl_functions.c b/port/linux/src/gl_functions.c
+index 44b88eabe..d9e99f849 100644
+--- a/port/linux/src/gl_functions.c
++++ b/port/linux/src/gl_functions.c
+@@ -43,7 +43,7 @@ int gl_functions_load(void)
+ 		!strcmp(#name, "glVertexAttribIFormat") || !strcmp(#name, "glVertexAttribBinding") || \
+ 		!strcmp(#name, "glBindVertexBuffer") || !strcmp(#name, "glGetQueryBufferObjectuiv") || \
+ 		!strcmp(#name, "glBindTextures"))
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_ANDROID32)
+ /* ES 3.2's; on 3.0 (iOS's newest) gl_initialize does without it */
+ #define GL_ES_OPTIONAL_FUNCTION(name) !strcmp(#name, "glDrawElementsBaseVertex")
+ #else
+diff --git a/port/linux/src/port_config.c b/port/linux/src/port_config.c
+index 11ea637ea..8a4f7f178 100644
+--- a/port/linux/src/port_config.c
++++ b/port/linux/src/port_config.c
+@@ -375,10 +375,10 @@ static const struct config_setting config_settings[] =
+ 		"Start in performance mode: the level drawn without its decals, dynamic lights, reflections and specular\n"
+ 		"highlights, and no lens flares, for the frame rate. Hold Back and press down on the d-pad (or F9) to switch\n"
+ 		"it in the game." },
+-	{ "display.performance_lines", _config_integer, "240", "HALO_PERFORMANCE_LINES", _environment_value,
++	{ "display.performance_lines", _config_integer, "200", "HALO_PERFORMANCE_LINES", _environment_value,
+ 		_platform_all,
+ 		"The lines the picture is drawn with in performance mode, scaled up to the screen: 480 is the game's own,\n"
+-		"240 a quarter of the pixels." },
++		"240 a quarter of the pixels, 200 (the default) a little over a sixth." },
+ 	{ "display.performance_view_distance", _config_real, "60.0", "HALO_PERFORMANCE_VIEW_DISTANCE",
+ 		_environment_value, _platform_all,
+ 		"How far performance mode sees, in the game's units (about 3 m): fog thickens to the distance and nothing\n"
+@@ -2160,6 +2160,9 @@ static const struct
+ 
+ #ifdef HALO_ANDROID
+ #define CONFIG_PLATFORM _platform_android
++#elif defined(HALO_TOUCH_SCREEN)
++/* (the 32-bit Android build: the desktop's settings and the touch controls') */
++#define CONFIG_PLATFORM (_platform_desktop | _platform_android)
+ #elif defined(HALO_XBOX_CONSOLE)
+ #define CONFIG_PLATFORM _platform_xbox
+ #elif defined(HALO_CONSOLE_GL_LAYER) && defined(_WIN32)
+@@ -4874,6 +4877,37 @@ static const struct config_value *config_value(const char *name, enum config_typ
+ 	static const struct config_value none = { 0, 0, 0.0, "" };
+ 	long index;
+ 
++	{ /* DEBUG: HALO_CONFIG_COUNT logs the names asked for most, each 50000 asks */
++		static int counting = -1;
++		static const char *names[64];
++		static unsigned long counts[64], total;
++
++		if (counting < 0)
++			counting = getenv("HALO_CONFIG_COUNT") != NULL;
++		if (counting)
++		{
++			unsigned long slot;
++
++			for (slot = 0; slot < 64 && names[slot] && names[slot] != name; slot++)
++			{
++			}
++			if (slot < 64)
++			{
++				names[slot] = name;
++				counts[slot]++;
++			}
++			if (++total % 50000 == 0)
++			{
++				for (slot = 0; slot < 64 && names[slot]; slot++)
++				{
++					if (counts[slot] > 500)
++						platform_log("config asks: %s %lu", names[slot], counts[slot]);
++					counts[slot] = 0;
++				}
++			}
++		}
++	}
++
+ 	pthread_mutex_lock(&config_lock);
+ 	if (!config_loaded)
+ 	{
+diff --git a/port/linux/src/sdl_platform.c b/port/linux/src/sdl_platform.c
+index 5c8b7f753..dd099a55e 100644
+--- a/port/linux/src/sdl_platform.c
++++ b/port/linux/src/sdl_platform.c
+@@ -554,7 +554,7 @@ BOOL platform_sdl_initialize(void)
+ 	Command-W does not quit) */
+ 	SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+ #endif
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 	/* landscape only; the back key arrives as a key event (xinput_sdl.c)
+ 	instead of closing the activity */
+ 	SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+@@ -1965,7 +1965,9 @@ BOOL platform_video_initialize(unsigned long width, unsigned long height)
+ 	host_renderer_vulkan = xgpu_vulkan;
+ #endif
+ 
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_ANDROID32)
++	/* (HALO_ANDROID32: a 32-bit Android build whose driver is ES 3.2, built as the other consoles' ports
++	are, not as the guest build's HALO_ANDROID code paths) */
+ 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+ 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+ 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+@@ -2133,6 +2135,19 @@ BOOL platform_video_initialize(unsigned long width, unsigned long height)
+ 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+ 		platform_gl_context = SDL_GL_CreateContext(platform_window);
+ 	}
++#endif
++#if defined(HALO_ANDROID32) && !defined(HALO_ANDROID)
++	/* ES 3.2 where the driver has it, then 3.1 (a Mali-T720's: the Echo Show 5), then 3.0 */
++	if (!platform_gl_context)
++	{
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
++		platform_gl_context = SDL_GL_CreateContext(platform_window);
++	}
++	if (!platform_gl_context)
++	{
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++		platform_gl_context = SDL_GL_CreateContext(platform_window);
++	}
+ #endif
+ 	if (!platform_gl_context)
+ 	{
+@@ -3391,7 +3406,7 @@ void platform_pump_events(void)
+ 			/* port: the held mouse let go while another window has the focus */
+ 			mouse_warp_release();
+ #endif
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 			touch_input_cancel();
+ #endif
+ 			break;
+@@ -3403,7 +3418,7 @@ void platform_pump_events(void)
+ 				platform_mouse_capture(TRUE);
+ #endif
+ 			break;
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 		case SDL_EVENT_FINGER_DOWN:
+ 		case SDL_EVENT_FINGER_MOTION:
+ 		case SDL_EVENT_FINGER_UP:
+@@ -3517,7 +3532,7 @@ int platform_binding_capture_poll(int *input)
+ 	return result;
+ }
+ 
+-#ifndef HALO_ANDROID
++#if !defined(HALO_ANDROID) && !defined(HALO_TOUCH_SCREEN)
+ /* ---------- the menus' pointer */
+ 
+ /* While a menu is up the mouse is released, its pointer shows (centered when
+diff --git a/port/linux/src/text_hires.c b/port/linux/src/text_hires.c
+index df894bf48..4c071b208 100644
+--- a/port/linux/src/text_hires.c
++++ b/port/linux/src/text_hires.c
+@@ -42,7 +42,14 @@ when the settings change while the game runs.
+ /* (the Xbox maps' tags and a Custom Edition loc.map's, which share names,
+ each at its oversamples) */
+ #define MAXIMUM_FONTS 16
++#ifdef HALO_ANDROID32
++/* a Mali driver copies a whole texture for each update that queued draws may still read, and a
++menu's text updates its atlas dozens of times a frame: the atlas is one channel, and 1024 square
++(1 MB a copy, not 16 MB), and the menus' glyphs fit */
++#define ATLAS_SIZE 1024
++#else
+ #define ATLAS_SIZE 2048
++#endif
+ /* clear texels around each glyph, so that filtering never reaches the next */
+ #define ATLAS_PADDING 2
+ #define GLYPH_CACHE_SIZE 4096
+@@ -554,11 +561,32 @@ unsigned int text_hires_atlas_texture(unsigned long data)
+ 		glBindTexture(GL_TEXTURE_2D, atlas_texture);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+ 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
++#ifdef HALO_ANDROID32
++		/* (white, the coverage its alpha: sampled as the RGBA the other builds have) */
++		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, ATLAS_SIZE, ATLAS_SIZE, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_ONE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_ONE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_ONE);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_RED);
++#else
+ 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ATLAS_SIZE, ATLAS_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++#endif
+ 		xgpu_gl_state_invalidate();
+ 		dirty_top = 0;
+ 		dirty_bottom = ATLAS_SIZE;
+ 	}
++#ifdef HALO_ANDROID32
++	if (dirty_top < dirty_bottom)
++	{
++		glBindTexture(GL_TEXTURE_2D, atlas_texture);
++		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, dirty_top, ATLAS_SIZE, (GLsizei)(dirty_bottom - dirty_top), GL_RED,
++			GL_UNSIGNED_BYTE, atlas + (long)dirty_top * ATLAS_SIZE);
++		xgpu_gl_state_invalidate();
++		dirty_top = ATLAS_SIZE;
++		dirty_bottom = 0;
++	}
++#else
+ 	if (dirty_top < dirty_bottom)
+ 	{
+ 		/* (white, the glyph's coverage its alpha, as the maps' fonts are) */
+@@ -584,6 +612,7 @@ unsigned int text_hires_atlas_texture(unsigned long data)
+ 			dirty_bottom = 0;
+ 		}
+ 	}
++#endif
+ 	return atlas_texture;
+ }
+ 
+diff --git a/port/linux/src/touch_input.c b/port/linux/src/touch_input.c
+index 4da56ca20..9b1178079 100644
+--- a/port/linux/src/touch_input.c
++++ b/port/linux/src/touch_input.c
+@@ -16,7 +16,7 @@ finger down (host_gesture_insets).
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ /* port/android/guest/runtime/guest_host.h */
+ void host_gesture_insets(int *insets);
+ void host_touch_read(int *state);
+@@ -86,7 +86,7 @@ static void menu_setup(void)
+ and zones matter only at a down, so changing them between two fingers is safe */
+ static void refresh_zones(int width, int height)
+ {
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 	int insets[4];
+ 
+ 	host_gesture_insets(insets);
+@@ -185,7 +185,7 @@ void touch_input_gamepad(XINPUT_GAMEPAD *pad)
+ 	}
+ }
+ 
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ /* ---------- the on-screen touch controls
+ 
+ The overlay (port/android/app/.../TouchControls.java) draws and reads its
+diff --git a/port/linux/src/touch_input.h b/port/linux/src/touch_input.h
+index e4df652ae..0de00b714 100644
+--- a/port/linux/src/touch_input.h
++++ b/port/linux/src/touch_input.h
+@@ -35,7 +35,7 @@ void touch_input_menu_read(struct platform_ui_pointer *pointer);
+ presses A for a few polls when a cinematic can be skipped */
+ void touch_input_gamepad(XINPUT_GAMEPAD *pad);
+ 
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ /* the on-screen touch controls (port/android/app/.../TouchControls.java),
+ an Android view over the game: tells them whether a menu is up and
+ input.touch_controls, and adds their stick and buttons to port 0's state */
+diff --git a/port/linux/src/xinput_sdl.c b/port/linux/src/xinput_sdl.c
+index 86bff183c..aa57b1df0 100644
+--- a/port/linux/src/xinput_sdl.c
++++ b/port/linux/src/xinput_sdl.c
+@@ -165,7 +165,7 @@ int halo_linux_mouse_look(short gamepad_index, float *yaw, float *pitch)
+ 	mouse_pending_y = 0.0f;
+ 	mouse_polls_unconsumed = 0;
+ 	pthread_mutex_unlock(&mouse_lock);
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 	/* the touch controls' swipe; it is not the mouse's aiming
+ 	(halo_linux_mouse_aiming), so a thumb keeps the stick's magnetism */
+ 	touch_input_look(scale, yaw, pitch);
+@@ -2529,7 +2529,7 @@ DWORD WINAPI XInputGetState(HANDLE device, PXINPUT_STATE state)
+ 		}
+ 		test_input_gamepad(&state->Gamepad);
+ 		touch_input_gamepad(&state->Gamepad);
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 		touch_input_controls(&state->Gamepad, input.menus);
+ #endif
+ #ifdef HALO_GUIDE
+@@ -2589,7 +2589,7 @@ DWORD WINAPI XInputSetState(HANDLE device, PXINPUT_FEEDBACK feedback)
+ 	feedback->Header.dwStatus = ERROR_SUCCESS;
+ 	if (port < 0)
+ 		return ERROR_DEVICE_NOT_CONNECTED;
+-#ifdef HALO_ANDROID
++#if defined(HALO_ANDROID) || defined(HALO_TOUCH_SCREEN)
+ 	/* the phone vibrates for the touch controls' player */
+ 	if (port == 0)
+ 		touch_input_rumble(feedback->Rumble.wLeftMotorSpeed, feedback->Rumble.wRightMotorSpeed);
+diff --git a/source/bitmaps/libtiff/tiffcompat.h b/source/bitmaps/libtiff/tiffcompat.h
+index d1a10aea3..84be3ea9f 100644
+--- a/source/bitmaps/libtiff/tiffcompat.h
++++ b/source/bitmaps/libtiff/tiffcompat.h
+@@ -170,7 +170,7 @@ extern	long lseek();
+ #define	WriteOK(fd, buf, size)	(write(fd, (char *)buf, size) == size)
+ #endif
+ 
+-#if defined(__MACH__) || defined(THINK_C)
++#if defined(__MACH__) || defined(THINK_C) || defined(__ANDROID__)
+ extern	void *malloc(size_t size);
+ extern	void *realloc(void *ptr, size_t size);
+ #else /* !__MACH__ && !THINK_C */
+diff --git a/source/main/main.c b/source/main/main.c
+index 853e3d61b..4c2da3ab3 100644
+--- a/source/main/main.c
++++ b/source/main/main.c
+@@ -768,6 +768,11 @@ boolean debug_frame_rate = FALSE;
+ boolean display_framerate = FALSE;
+ boolean display_vblank_deltas = FALSE;
+ boolean display_precache_progress = FALSE;
++/* (packed, so placed anywhere: the render windows in it are read with the instructions that need
++a 4-byte aligned address, which a 32-bit ARM kernel without an alignment trap does not forgive) */
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((aligned(4)))
++#endif
+ struct _screenshot_and_framerate_globals global_screenshot_count = { 0 };
+ boolean debug_render_freeze;
+ 
